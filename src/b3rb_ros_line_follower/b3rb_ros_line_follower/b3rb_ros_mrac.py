@@ -84,6 +84,15 @@ class VehicleEstimate:
     status_ready: bool = False
 
 
+@dataclass
+class CameraMeasurement:
+    have_measurement: bool = False
+    use_integral: bool = False
+    vector_count: int = 0
+    ye: float = 0.0
+    psi_rel: float = 0.0
+
+
 class LineFollower(Node):
     """Initializes line follower node with the required publishers and subscriptions."""
 
@@ -117,7 +126,6 @@ class LineFollower(Node):
             QOS_PROFILE_DEFAULT
         )
 
-        #step 4 additions start here
         self.vehicle = VehicleEstimate()
 
         self.subscription_odom = self.create_subscription(
@@ -138,7 +146,6 @@ class LineFollower(Node):
             0.5,
             self.debug_timer_callback
         )
-        #step 4 additions end here
 
         self.traffic_status = TrafficStatus()
         self.obstacle_detected = False
@@ -154,6 +161,8 @@ class LineFollower(Node):
         self.filtered_center_top = None
         self.filtered_center_bottom = None
         self.last_lane_width = None
+
+        self.latest_camera_measurement = CameraMeasurement()
 
         #previous odometry sample used to numerically differentiate pose
         self.prev_odom_x = None
@@ -219,16 +228,23 @@ class LineFollower(Node):
         """Wrap angle to [-pi, pi]."""
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def edge_vectors_callback(self, message):
-        """Uses edge vectors to compute speed and turn."""
-        vectors = message
-        half_width = vectors.image_width / 2.0 if vectors.image_width > 0 else 1.0
-        dt = self.get_dt()
+    def extract_camera_measurement(self, vectors, half_width):
+        """
+        Extract camera-side measurements only.
 
-        raw_turn = self.last_turn
-        target_speed = SPEED_SEARCH
-        have_measurement = False
-        use_integral = False
+        Returns:
+            ye       -> approximate lateral deviation from track center
+            psi_rel  -> approximate heading error relative to track tangent
+
+        This function does NOT compute commands.
+        """
+        measurement = CameraMeasurement(
+            have_measurement=False,
+            use_integral=False,
+            vector_count=vectors.vector_count,
+            ye=0.0,
+            psi_rel=0.0
+        )
 
         if vectors.vector_count >= 2:
             #vector_1 = left edge, vector_2 = right edge
@@ -268,8 +284,8 @@ class LineFollower(Node):
                 CENTER_FILTER_ALPHA_TWO_EDGES
             )
 
-            have_measurement = True
-            use_integral = True
+            measurement.have_measurement = True
+            measurement.use_integral = True
 
         elif vectors.vector_count == 1:
             edge_top_x = vectors.vector_1[0].x
@@ -302,22 +318,33 @@ class LineFollower(Node):
                 CENTER_FILTER_ALPHA_ONE_EDGE
             )
 
-            have_measurement = True
-            use_integral = False
+            measurement.have_measurement = True
+            measurement.use_integral = False
 
-        else:
-            #no edges visible: hold last steering gently and move slowly
-            self.center_error_integral *= 0.85
-            self.prev_center_error *= 0.85
-            raw_turn = self.last_turn * 0.96
-            target_speed = SPEED_SEARCH
+        if measurement.have_measurement:
+            measurement.ye = (half_width - self.filtered_center_bottom) / half_width
+            measurement.psi_rel = (self.filtered_center_bottom - self.filtered_center_top) / half_width
 
-        if have_measurement:
-            center_error = (half_width - self.filtered_center_bottom) / half_width
-            heading_error = (self.filtered_center_bottom - self.filtered_center_top) / half_width
+        self.latest_camera_measurement = measurement
+        return measurement
 
-            if use_integral:
-                self.center_error_integral += center_error * dt
+    def edge_vectors_callback(self, message):
+        """Uses camera measurements to compute speed and turn."""
+        vectors = message
+        half_width = vectors.image_width / 2.0 if vectors.image_width > 0 else 1.0
+        dt = self.get_dt()
+
+        raw_turn = self.last_turn
+        target_speed = SPEED_SEARCH
+
+        camera = self.extract_camera_measurement(vectors, half_width)
+
+        if camera.have_measurement:
+            ye = camera.ye
+            psi_rel = camera.psi_rel
+
+            if camera.use_integral:
+                self.center_error_integral += ye * dt
                 self.center_error_integral = self.clamp(
                     self.center_error_integral,
                     -INTEGRAL_LIMIT,
@@ -326,21 +353,21 @@ class LineFollower(Node):
             else:
                 self.center_error_integral *= 0.90
 
-            derivative = (center_error - self.prev_center_error) / dt
-            self.prev_center_error = center_error
+            derivative = (ye - self.prev_center_error) / dt
+            self.prev_center_error = ye
 
             raw_turn = (
-                KP_CENTER * center_error +
+                KP_CENTER * ye +
                 KI_CENTER * self.center_error_integral +
                 KD_CENTER * derivative +
-                KP_HEADING * heading_error
+                KP_HEADING * psi_rel
             )
 
             raw_turn = self.clamp(raw_turn, TURN_MIN, TURN_MAX)
 
             turn_strength = abs(raw_turn)
 
-            if vectors.vector_count >= 2:
+            if camera.vector_count >= 2:
                 if turn_strength < 0.10:
                     target_speed = SPEED_STRAIGHT
                 elif turn_strength < 0.24:
@@ -349,6 +376,13 @@ class LineFollower(Node):
                     target_speed = SPEED_CURVE
             else:
                 target_speed = SPEED_ONE_EDGE
+
+        else:
+            #no edges visible: hold last steering gently and move slowly
+            self.center_error_integral *= 0.85
+            self.prev_center_error *= 0.85
+            raw_turn = self.last_turn * 0.96
+            target_speed = SPEED_SEARCH
 
         #keep lidar disabled for Raceway_1
         if self.ramp_detected:
@@ -376,23 +410,14 @@ class LineFollower(Node):
 
         self.rover_move_manual_mode(speed, turn)
 
-    #step 4 additions start here
     def odometry_callback(self, message):
-        """Stores odometry signals for later MRAC use.
-
-        Important:
-        /cerebri/out/odometry in the current stack has changing pose but zero twist.
-        So we numerically differentiate pose to estimate vx, vy, and yaw rate.
-        """
-        #current pose
+        """Stores odometry signals for later MRAC use."""
         x = float(message.pose.pose.position.x)
         y = float(message.pose.pose.position.y)
         yaw = self.quaternion_to_yaw(message.pose.pose.orientation)
 
-        #timestamp from message
         t = float(message.header.stamp.sec) + 1e-9 * float(message.header.stamp.nanosec)
 
-        #always store absolute pose
         self.vehicle.x = x
         self.vehicle.y = y
 
@@ -404,18 +429,13 @@ class LineFollower(Node):
         ):
             dt = t - self.prev_odom_time
 
-            #protect against bad timestamps
             if dt > 1e-4:
-                #map/inertial frame velocities
                 vx_world = (x - self.prev_odom_x) / dt
                 vy_world = (y - self.prev_odom_y) / dt
 
-                #yaw rate
                 dyaw = self.wrap_angle(yaw - self.prev_odom_yaw)
                 yaw_rate = dyaw / dt
 
-                #rotate world velocity into body frame
-                #body x = forward, body y = left
                 vx_body = math.cos(yaw) * vx_world + math.sin(yaw) * vy_world
                 vy_body = -math.sin(yaw) * vx_world + math.cos(yaw) * vy_world
 
@@ -423,7 +443,6 @@ class LineFollower(Node):
                 self.vehicle.vy = vy_body
                 self.vehicle.yaw_rate = yaw_rate
 
-        #update previous sample
         self.prev_odom_x = x
         self.prev_odom_y = y
         self.prev_odom_yaw = yaw
@@ -443,6 +462,13 @@ class LineFollower(Node):
     def debug_timer_callback(self):
         """Prints the incoming MRAC-related measurements every 0.5 s."""
         if self.vehicle.odom_ready:
+            if self.latest_camera_measurement.have_measurement:
+                ye_text = f"{self.latest_camera_measurement.ye:.3f}"
+                psi_text = f"{self.latest_camera_measurement.psi_rel:.3f}"
+            else:
+                ye_text = "None"
+                psi_text = "None"
+
             self.get_logger().info(
                 f"[MRAC scaffold] "
                 f"vx={self.vehicle.vx:.3f}, "
@@ -450,12 +476,13 @@ class LineFollower(Node):
                 f"r={self.vehicle.yaw_rate:.3f}, "
                 f"x={self.vehicle.x:.3f}, "
                 f"y={self.vehicle.y:.3f}, "
+                f"ye={ye_text}, "
+                f"psi_rel={psi_text}, "
                 f"battery_pct={self.vehicle.battery_pct}, "
                 f"battery_power={self.vehicle.battery_power}"
             )
         else:
             self.get_logger().info("[MRAC scaffold] waiting for odometry...")
-    #step 4 additions end here
 
     def traffic_status_callback(self, message):
         """Updates instance member with traffic status."""
