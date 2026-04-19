@@ -21,9 +21,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-                'vectors = b3rb_ros_line_follower.b3rb_ros_edge_vectors:main',
-                'runner = b3rb_ros_line_follower.b3rb_ros_line_follower:main',
-                'detect = b3rb_ros_line_follower.b3rb_ros_object_recog:main',
+            'vectors = b3rb_ros_line_follower.b3rb_ros_edge_vectors:main',
+            'runner = b3rb_ros_line_follower.b3rb_ros_line_follower:main',
+            'runner_mrac = b3rb_ros_line_follower.b3rb_ros_mrac:main',
+            'detect = b3rb_ros_line_follower.b3rb_ros_object_recog:main',
         ],
     },
 )
