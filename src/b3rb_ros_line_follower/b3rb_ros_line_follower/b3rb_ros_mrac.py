@@ -68,10 +68,6 @@ MAX_CENTER_JUMP_RATIO = 0.16
 CENTER_FILTER_ALPHA_TWO_EDGES = 0.30
 CENTER_FILTER_ALPHA_ONE_EDGE = 0.20
 
-#state filtering
-VY_FILTER_ALPHA = 0.20
-YAW_RATE_FILTER_ALPHA = 0.60
-
 
 @dataclass
 class VehicleEstimate:
@@ -164,10 +160,6 @@ class LineFollower(Node):
         self.prev_odom_y = None
         self.prev_odom_yaw = None
         self.prev_odom_time = None
-
-        #light filtered states for estimator/controller use
-        self.filtered_vy_state = None
-        self.filtered_yaw_rate_state = None
 
     def clamp(self, value, min_value, max_value):
         """Clamps value into [min_value, max_value]."""
@@ -388,9 +380,9 @@ class LineFollower(Node):
     def odometry_callback(self, message):
         """Stores odometry signals for later MRAC use.
 
-        /cerebri/out/odometry has changing pose but zero twist in the current stack,
-        so pose is numerically differentiated to estimate vx, vy, and yaw rate.
-        Light filtering is applied to vy and yaw_rate only.
+        Important:
+        /cerebri/out/odometry in the current stack has changing pose but zero twist.
+        So we numerically differentiate pose to estimate vx, vy, and yaw rate.
         """
         #current pose
         x = float(message.pose.pose.position.x)
@@ -418,32 +410,18 @@ class LineFollower(Node):
                 vx_world = (x - self.prev_odom_x) / dt
                 vy_world = (y - self.prev_odom_y) / dt
 
-                #yaw rate from wrapped yaw difference
+                #yaw rate
                 dyaw = self.wrap_angle(yaw - self.prev_odom_yaw)
-                yaw_rate_raw = dyaw / dt
+                yaw_rate = dyaw / dt
 
                 #rotate world velocity into body frame
                 #body x = forward, body y = left
                 vx_body = math.cos(yaw) * vx_world + math.sin(yaw) * vy_world
-                vy_body_raw = -math.sin(yaw) * vx_world + math.cos(yaw) * vy_world
+                vy_body = -math.sin(yaw) * vx_world + math.cos(yaw) * vy_world
 
-                #keep vx unfiltered for now
                 self.vehicle.vx = vx_body
-
-                #light low-pass filtering on vy and yaw_rate
-                self.filtered_vy_state = self.low_pass(
-                    self.filtered_vy_state,
-                    vy_body_raw,
-                    VY_FILTER_ALPHA
-                )
-                self.filtered_yaw_rate_state = self.low_pass(
-                    self.filtered_yaw_rate_state,
-                    yaw_rate_raw,
-                    YAW_RATE_FILTER_ALPHA
-                )
-
-                self.vehicle.vy = self.filtered_vy_state
-                self.vehicle.yaw_rate = self.filtered_yaw_rate_state
+                self.vehicle.vy = vy_body
+                self.vehicle.yaw_rate = yaw_rate
 
         #update previous sample
         self.prev_odom_x = x
