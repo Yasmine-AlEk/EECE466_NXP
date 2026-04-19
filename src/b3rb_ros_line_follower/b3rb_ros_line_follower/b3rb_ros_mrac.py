@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import time
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -154,6 +155,12 @@ class LineFollower(Node):
         self.filtered_center_bottom = None
         self.last_lane_width = None
 
+        #previous odometry sample used to numerically differentiate pose
+        self.prev_odom_x = None
+        self.prev_odom_y = None
+        self.prev_odom_yaw = None
+        self.prev_odom_time = None
+
     def clamp(self, value, min_value, max_value):
         """Clamps value into [min_value, max_value]."""
         return max(min_value, min(max_value, value))
@@ -201,6 +208,16 @@ class LineFollower(Node):
             center_bottom = edge_bottom_x - lane_half_width
 
         return center_top, center_bottom
+
+    def quaternion_to_yaw(self, q):
+        """Convert quaternion to planar yaw angle."""
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def wrap_angle(self, angle):
+        """Wrap angle to [-pi, pi]."""
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     def edge_vectors_callback(self, message):
         """Uses edge vectors to compute speed and turn."""
@@ -361,13 +378,56 @@ class LineFollower(Node):
 
     #step 4 additions start here
     def odometry_callback(self, message):
-        """Stores odometry signals for later MRAC use."""
-        self.vehicle.vx = float(message.twist.twist.linear.x)
-        self.vehicle.vy = float(message.twist.twist.linear.y)
-        self.vehicle.yaw_rate = float(message.twist.twist.angular.z)
+        """Stores odometry signals for later MRAC use.
 
-        self.vehicle.x = float(message.pose.pose.position.x)
-        self.vehicle.y = float(message.pose.pose.position.y)
+        Important:
+        /cerebri/out/odometry in the current stack has changing pose but zero twist.
+        So we numerically differentiate pose to estimate vx, vy, and yaw rate.
+        """
+        #current pose
+        x = float(message.pose.pose.position.x)
+        y = float(message.pose.pose.position.y)
+        yaw = self.quaternion_to_yaw(message.pose.pose.orientation)
+
+        #timestamp from message
+        t = float(message.header.stamp.sec) + 1e-9 * float(message.header.stamp.nanosec)
+
+        #always store absolute pose
+        self.vehicle.x = x
+        self.vehicle.y = y
+
+        if (
+            self.prev_odom_x is not None and
+            self.prev_odom_y is not None and
+            self.prev_odom_yaw is not None and
+            self.prev_odom_time is not None
+        ):
+            dt = t - self.prev_odom_time
+
+            #protect against bad timestamps
+            if dt > 1e-4:
+                #map/inertial frame velocities
+                vx_world = (x - self.prev_odom_x) / dt
+                vy_world = (y - self.prev_odom_y) / dt
+
+                #yaw rate
+                dyaw = self.wrap_angle(yaw - self.prev_odom_yaw)
+                yaw_rate = dyaw / dt
+
+                #rotate world velocity into body frame
+                #body x = forward, body y = left
+                vx_body = math.cos(yaw) * vx_world + math.sin(yaw) * vy_world
+                vy_body = -math.sin(yaw) * vx_world + math.cos(yaw) * vy_world
+
+                self.vehicle.vx = vx_body
+                self.vehicle.vy = vy_body
+                self.vehicle.yaw_rate = yaw_rate
+
+        #update previous sample
+        self.prev_odom_x = x
+        self.prev_odom_y = y
+        self.prev_odom_yaw = yaw
+        self.prev_odom_time = t
 
         self.vehicle.odom_ready = True
 
