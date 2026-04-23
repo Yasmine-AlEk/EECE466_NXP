@@ -37,48 +37,68 @@ TURN_MAX = +1.0
 SPEED_MIN = 0.0
 SPEED_MAX = 1.0
 
-#speed tuning
+# speed tuning
 SPEED_SEARCH = 0.22
 SPEED_ONE_EDGE = 0.30
 SPEED_CURVE = 0.40
 SPEED_STRAIGHT = 0.56
 
-#lane estimation when only one edge is visible
+# lane estimation when only one edge is visible
 DEFAULT_SINGLE_EDGE_LANE_HALF_WIDTH_RATIO = 0.42
 
-#PID gains
+# PID gains
 KP_CENTER = 0.95
 KI_CENTER = 0.02
 KD_CENTER = 0.12
 
-#preview / heading term
+# preview / heading term
 KP_HEADING = 0.45
 
-#command smoothing
+# command smoothing
 TURN_SMOOTHING_OLD = 0.70
 TURN_SMOOTHING_NEW = 0.30
 SPEED_SMOOTHING_OLD = 0.60
 SPEED_SMOOTHING_NEW = 0.40
 
-#anti-windup
+# anti-windup
 INTEGRAL_LIMIT = 0.80
 
-#measurement filtering
+# measurement filtering
 MAX_CENTER_JUMP_RATIO = 0.16
 CENTER_FILTER_ALPHA_TWO_EDGES = 0.30
 CENTER_FILTER_ALPHA_ONE_EDGE = 0.20
 
+# ==========================================
+# SIGNAL NAMING CONVENTION
+# ------------------------------------------
+# _meas  : directly measured from topic/sensor
+# _recon : reconstructed from measured signals
+# _filt  : filtered/smoothed version
+# _est   : model/observer/actuator estimate
+#
+# Examples:
+# x_meas, y_meas, yaw_meas
+# vx_recon, vy_recon, r_recon
+# ye_cam_filt, psi_rel_cam_filt
+# delta_f_est, bbatt_est
+# ==========================================
+
 
 @dataclass
-class VehicleEstimate:
-    vx: float = 0.0
-    vy: float = 0.0
-    yaw_rate: float = 0.0
-    x: float = 0.0
-    y: float = 0.0
+class VehicleSignals:
+    # Direct odometry pose measurements
+    x_meas: float = 0.0
+    y_meas: float = 0.0
+    yaw_meas: float = 0.0
 
-    battery_pct: Optional[float] = None
-    battery_power: Optional[float] = None
+    # Reconstructed body-frame states from odometry pose differences
+    vx_recon: float = 0.0
+    vy_recon: float = 0.0
+    r_recon: float = 0.0
+
+    # Direct status measurements
+    battery_pct_meas: Optional[float] = None
+    battery_power_meas: Optional[float] = None
 
     odom_ready: bool = False
     status_ready: bool = False
@@ -89,8 +109,10 @@ class CameraMeasurement:
     have_measurement: bool = False
     use_integral: bool = False
     vector_count: int = 0
-    ye: float = 0.0
-    psi_rel: float = 0.0
+
+    # Camera-derived filtered measurement-layer outputs
+    ye_cam_filt: float = 0.0
+    psi_rel_cam_filt: float = 0.0
 
 
 class LineFollower(Node):
@@ -126,7 +148,7 @@ class LineFollower(Node):
             QOS_PROFILE_DEFAULT
         )
 
-        self.vehicle = VehicleEstimate()
+        self.vehicle = VehicleSignals()
 
         self.subscription_odom = self.create_subscription(
             Odometry,
@@ -151,41 +173,42 @@ class LineFollower(Node):
         self.obstacle_detected = False
         self.ramp_detected = False
 
-        self.last_turn = 0.0
-        self.last_speed = 0.0
+        self.last_turn_cmd = 0.0
+        self.last_speed_cmd = 0.0
 
         self.center_error_integral = 0.0
         self.prev_center_error = 0.0
-        self.prev_time = time.monotonic()
+        self.prev_control_time = time.monotonic()
 
-        self.filtered_center_top = None
-        self.filtered_center_bottom = None
-        self.last_lane_width = None
+        # filtered camera-side lane-center quantities
+        self.center_top_filt = None
+        self.center_bottom_filt = None
+        self.lane_width_filt = None
 
         self.latest_camera_measurement = CameraMeasurement()
 
-        #previous odometry sample used to numerically differentiate pose
-        self.prev_odom_x = None
-        self.prev_odom_y = None
-        self.prev_odom_yaw = None
+        # previous direct odometry pose samples used for reconstruction
+        self.prev_x_meas = None
+        self.prev_y_meas = None
+        self.prev_yaw_meas = None
         self.prev_odom_time = None
 
     def clamp(self, value, min_value, max_value):
         """Clamps value into [min_value, max_value]."""
         return max(min_value, min(max_value, value))
 
-    def rover_move_manual_mode(self, speed, turn):
+    def rover_move_manual_mode(self, speed_cmd, turn_cmd):
         """Operates the rover in manual mode by publishing on /cerebri/in/joy."""
         msg = Joy()
         msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
-        msg.axes = [0.0, speed, 0.0, turn]
+        msg.axes = [0.0, speed_cmd, 0.0, turn_cmd]
         self.publisher_joy.publish(msg)
 
     def get_dt(self):
         """Returns a safe controller timestep."""
         now = time.monotonic()
-        dt = now - self.prev_time
-        self.prev_time = now
+        dt = now - self.prev_control_time
+        self.prev_control_time = now
 
         if dt <= 0.0 or dt > 0.2:
             dt = 0.05
@@ -198,25 +221,25 @@ class LineFollower(Node):
             return new_value
         return (1.0 - alpha) * previous_value + alpha * new_value
 
-    def estimate_center_from_one_edge(self, edge_top_x, edge_bottom_x, half_width):
+    def estimate_center_from_one_edge(self, edge_top_x_meas, edge_bottom_x_meas, half_width):
         """Estimate lane center using one visible border."""
-        if self.last_lane_width is not None and self.last_lane_width > 1.0:
-            lane_half_width = 0.5 * self.last_lane_width
+        if self.lane_width_filt is not None and self.lane_width_filt > 1.0:
+            lane_half_width = 0.5 * self.lane_width_filt
         else:
             lane_half_width = DEFAULT_SINGLE_EDGE_LANE_HALF_WIDTH_RATIO * half_width
 
-        edge_mid_x = 0.5 * (edge_top_x + edge_bottom_x)
+        edge_mid_x = 0.5 * (edge_top_x_meas + edge_bottom_x_meas)
 
         if edge_mid_x < half_width:
-            #left border visible
-            center_top = edge_top_x + lane_half_width
-            center_bottom = edge_bottom_x + lane_half_width
+            # left border visible
+            center_top_est = edge_top_x_meas + lane_half_width
+            center_bottom_est = edge_bottom_x_meas + lane_half_width
         else:
-            #right border visible
-            center_top = edge_top_x - lane_half_width
-            center_bottom = edge_bottom_x - lane_half_width
+            # right border visible
+            center_top_est = edge_top_x_meas - lane_half_width
+            center_bottom_est = edge_bottom_x_meas - lane_half_width
 
-        return center_top, center_bottom
+        return center_top_est, center_bottom_est
 
     def quaternion_to_yaw(self, q):
         """Convert quaternion to planar yaw angle."""
@@ -233,8 +256,8 @@ class LineFollower(Node):
         Extract camera-side measurements only.
 
         Returns:
-            ye       -> approximate lateral deviation from track center
-            psi_rel  -> approximate heading error relative to track tangent
+            ye_cam_filt       -> approximate lateral deviation from track center
+            psi_rel_cam_filt  -> approximate heading error relative to track tangent
 
         This function does NOT compute commands.
         """
@@ -242,45 +265,45 @@ class LineFollower(Node):
             have_measurement=False,
             use_integral=False,
             vector_count=vectors.vector_count,
-            ye=0.0,
-            psi_rel=0.0
+            ye_cam_filt=0.0,
+            psi_rel_cam_filt=0.0
         )
 
         if vectors.vector_count >= 2:
-            #vector_1 = left edge, vector_2 = right edge
-            left_top_x = vectors.vector_1[0].x
-            left_bottom_x = vectors.vector_1[1].x
-            right_top_x = vectors.vector_2[0].x
-            right_bottom_x = vectors.vector_2[1].x
+            # vector_1 = left edge, vector_2 = right edge
+            left_top_x_meas = vectors.vector_1[0].x
+            left_bottom_x_meas = vectors.vector_1[1].x
+            right_top_x_meas = vectors.vector_2[0].x
+            right_bottom_x_meas = vectors.vector_2[1].x
 
-            measured_center_top = 0.5 * (left_top_x + right_top_x)
-            measured_center_bottom = 0.5 * (left_bottom_x + right_bottom_x)
-            measured_lane_width = right_bottom_x - left_bottom_x
+            center_top_meas = 0.5 * (left_top_x_meas + right_top_x_meas)
+            center_bottom_meas = 0.5 * (left_bottom_x_meas + right_bottom_x_meas)
+            lane_width_meas = right_bottom_x_meas - left_bottom_x_meas
 
-            if measured_lane_width > 1.0:
-                if self.last_lane_width is None:
-                    self.last_lane_width = measured_lane_width
+            if lane_width_meas > 1.0:
+                if self.lane_width_filt is None:
+                    self.lane_width_filt = lane_width_meas
                 else:
-                    self.last_lane_width = 0.80 * self.last_lane_width + 0.20 * measured_lane_width
+                    self.lane_width_filt = 0.80 * self.lane_width_filt + 0.20 * lane_width_meas
 
             max_jump = MAX_CENTER_JUMP_RATIO * half_width
 
-            if self.filtered_center_top is not None:
-                jump_top = measured_center_top - self.filtered_center_top
-                measured_center_top = self.filtered_center_top + self.clamp(jump_top, -max_jump, max_jump)
+            if self.center_top_filt is not None:
+                jump_top = center_top_meas - self.center_top_filt
+                center_top_meas = self.center_top_filt + self.clamp(jump_top, -max_jump, max_jump)
 
-            if self.filtered_center_bottom is not None:
-                jump_bottom = measured_center_bottom - self.filtered_center_bottom
-                measured_center_bottom = self.filtered_center_bottom + self.clamp(jump_bottom, -max_jump, max_jump)
+            if self.center_bottom_filt is not None:
+                jump_bottom = center_bottom_meas - self.center_bottom_filt
+                center_bottom_meas = self.center_bottom_filt + self.clamp(jump_bottom, -max_jump, max_jump)
 
-            self.filtered_center_top = self.low_pass(
-                self.filtered_center_top,
-                measured_center_top,
+            self.center_top_filt = self.low_pass(
+                self.center_top_filt,
+                center_top_meas,
                 CENTER_FILTER_ALPHA_TWO_EDGES
             )
-            self.filtered_center_bottom = self.low_pass(
-                self.filtered_center_bottom,
-                measured_center_bottom,
+            self.center_bottom_filt = self.low_pass(
+                self.center_bottom_filt,
+                center_bottom_meas,
                 CENTER_FILTER_ALPHA_TWO_EDGES
             )
 
@@ -288,33 +311,33 @@ class LineFollower(Node):
             measurement.use_integral = True
 
         elif vectors.vector_count == 1:
-            edge_top_x = vectors.vector_1[0].x
-            edge_bottom_x = vectors.vector_1[1].x
+            edge_top_x_meas = vectors.vector_1[0].x
+            edge_bottom_x_meas = vectors.vector_1[1].x
 
-            measured_center_top, measured_center_bottom = self.estimate_center_from_one_edge(
-                edge_top_x,
-                edge_bottom_x,
+            center_top_est, center_bottom_est = self.estimate_center_from_one_edge(
+                edge_top_x_meas,
+                edge_bottom_x_meas,
                 half_width
             )
 
             max_jump = MAX_CENTER_JUMP_RATIO * half_width
 
-            if self.filtered_center_top is not None:
-                jump_top = measured_center_top - self.filtered_center_top
-                measured_center_top = self.filtered_center_top + self.clamp(jump_top, -max_jump, max_jump)
+            if self.center_top_filt is not None:
+                jump_top = center_top_est - self.center_top_filt
+                center_top_est = self.center_top_filt + self.clamp(jump_top, -max_jump, max_jump)
 
-            if self.filtered_center_bottom is not None:
-                jump_bottom = measured_center_bottom - self.filtered_center_bottom
-                measured_center_bottom = self.filtered_center_bottom + self.clamp(jump_bottom, -max_jump, max_jump)
+            if self.center_bottom_filt is not None:
+                jump_bottom = center_bottom_est - self.center_bottom_filt
+                center_bottom_est = self.center_bottom_filt + self.clamp(jump_bottom, -max_jump, max_jump)
 
-            self.filtered_center_top = self.low_pass(
-                self.filtered_center_top,
-                measured_center_top,
+            self.center_top_filt = self.low_pass(
+                self.center_top_filt,
+                center_top_est,
                 CENTER_FILTER_ALPHA_ONE_EDGE
             )
-            self.filtered_center_bottom = self.low_pass(
-                self.filtered_center_bottom,
-                measured_center_bottom,
+            self.center_bottom_filt = self.low_pass(
+                self.center_bottom_filt,
+                center_bottom_est,
                 CENTER_FILTER_ALPHA_ONE_EDGE
             )
 
@@ -322,8 +345,8 @@ class LineFollower(Node):
             measurement.use_integral = False
 
         if measurement.have_measurement:
-            measurement.ye = (half_width - self.filtered_center_bottom) / half_width
-            measurement.psi_rel = (self.filtered_center_bottom - self.filtered_center_top) / half_width
+            measurement.ye_cam_filt = (half_width - self.center_bottom_filt) / half_width
+            measurement.psi_rel_cam_filt = (self.center_bottom_filt - self.center_top_filt) / half_width
 
         self.latest_camera_measurement = measurement
         return measurement
@@ -334,17 +357,17 @@ class LineFollower(Node):
         half_width = vectors.image_width / 2.0 if vectors.image_width > 0 else 1.0
         dt = self.get_dt()
 
-        raw_turn = self.last_turn
-        target_speed = SPEED_SEARCH
+        raw_turn_cmd = self.last_turn_cmd
+        target_speed_cmd = SPEED_SEARCH
 
         camera = self.extract_camera_measurement(vectors, half_width)
 
         if camera.have_measurement:
-            ye = camera.ye
-            psi_rel = camera.psi_rel
+            ye_cam_filt = camera.ye_cam_filt
+            psi_rel_cam_filt = camera.psi_rel_cam_filt
 
             if camera.use_integral:
-                self.center_error_integral += ye * dt
+                self.center_error_integral += ye_cam_filt * dt
                 self.center_error_integral = self.clamp(
                     self.center_error_integral,
                     -INTEGRAL_LIMIT,
@@ -353,133 +376,143 @@ class LineFollower(Node):
             else:
                 self.center_error_integral *= 0.90
 
-            derivative = (ye - self.prev_center_error) / dt
-            self.prev_center_error = ye
+            center_error_derivative = (ye_cam_filt - self.prev_center_error) / dt
+            self.prev_center_error = ye_cam_filt
 
-            raw_turn = (
-                KP_CENTER * ye +
+            raw_turn_cmd = (
+                KP_CENTER * ye_cam_filt +
                 KI_CENTER * self.center_error_integral +
-                KD_CENTER * derivative +
-                KP_HEADING * psi_rel
+                KD_CENTER * center_error_derivative +
+                KP_HEADING * psi_rel_cam_filt
             )
 
-            raw_turn = self.clamp(raw_turn, TURN_MIN, TURN_MAX)
+            raw_turn_cmd = self.clamp(raw_turn_cmd, TURN_MIN, TURN_MAX)
 
-            turn_strength = abs(raw_turn)
+            turn_strength = abs(raw_turn_cmd)
 
             if camera.vector_count >= 2:
                 if turn_strength < 0.10:
-                    target_speed = SPEED_STRAIGHT
+                    target_speed_cmd = SPEED_STRAIGHT
                 elif turn_strength < 0.24:
-                    target_speed = 0.48
+                    target_speed_cmd = 0.48
                 else:
-                    target_speed = SPEED_CURVE
+                    target_speed_cmd = SPEED_CURVE
             else:
-                target_speed = SPEED_ONE_EDGE
+                target_speed_cmd = SPEED_ONE_EDGE
 
         else:
-            #no edges visible: hold last steering gently and move slowly
+            # no edges visible: hold last steering gently and move slowly
             self.center_error_integral *= 0.85
             self.prev_center_error *= 0.85
-            raw_turn = self.last_turn * 0.96
-            target_speed = SPEED_SEARCH
+            raw_turn_cmd = self.last_turn_cmd * 0.96
+            target_speed_cmd = SPEED_SEARCH
 
-        #keep lidar disabled for Raceway_1
+        # keep lidar disabled for Raceway_1
         if self.ramp_detected:
-            target_speed = max(target_speed, SPEED_ONE_EDGE)
+            target_speed_cmd = max(target_speed_cmd, SPEED_ONE_EDGE)
 
         if self.traffic_status.stop_sign:
-            target_speed = SPEED_MIN
+            target_speed_cmd = SPEED_MIN
             self.center_error_integral = 0.0
 
         if self.obstacle_detected:
-            target_speed = SPEED_MIN
+            target_speed_cmd = SPEED_MIN
             self.center_error_integral = 0.0
 
-        turn = TURN_SMOOTHING_OLD * self.last_turn + TURN_SMOOTHING_NEW * raw_turn
-        turn = self.clamp(turn, RIGHT_TURN, LEFT_TURN)
+        turn_cmd = TURN_SMOOTHING_OLD * self.last_turn_cmd + TURN_SMOOTHING_NEW * raw_turn_cmd
+        turn_cmd = self.clamp(turn_cmd, RIGHT_TURN, LEFT_TURN)
 
-        if target_speed == SPEED_MIN:
-            speed = SPEED_MIN
+        if target_speed_cmd == SPEED_MIN:
+            speed_cmd = SPEED_MIN
         else:
-            speed = SPEED_SMOOTHING_OLD * self.last_speed + SPEED_SMOOTHING_NEW * target_speed
-            speed = self.clamp(speed, SPEED_MIN, SPEED_MAX)
+            speed_cmd = SPEED_SMOOTHING_OLD * self.last_speed_cmd + SPEED_SMOOTHING_NEW * target_speed_cmd
+            speed_cmd = self.clamp(speed_cmd, SPEED_MIN, SPEED_MAX)
 
-        self.last_turn = turn
-        self.last_speed = speed
+        self.last_turn_cmd = turn_cmd
+        self.last_speed_cmd = speed_cmd
 
-        self.rover_move_manual_mode(speed, turn)
+        self.rover_move_manual_mode(speed_cmd, turn_cmd)
 
     def odometry_callback(self, message):
-        """Stores odometry signals for later MRAC use."""
-        x = float(message.pose.pose.position.x)
-        y = float(message.pose.pose.position.y)
-        yaw = self.quaternion_to_yaw(message.pose.pose.orientation)
+        """
+        Stores odometry-related signals for later MRAC use.
 
-        t = float(message.header.stamp.sec) + 1e-9 * float(message.header.stamp.nanosec)
+        Directly measured from odometry pose:
+        - x_meas, y_meas, yaw_meas
 
-        self.vehicle.x = x
-        self.vehicle.y = y
+        Reconstructed from pose differences:
+        - vx_recon, vy_recon, r_recon
+        """
+        x_meas = float(message.pose.pose.position.x)
+        y_meas = float(message.pose.pose.position.y)
+        yaw_meas = self.quaternion_to_yaw(message.pose.pose.orientation)
+
+        t_meas = float(message.header.stamp.sec) + 1e-9 * float(message.header.stamp.nanosec)
+
+        self.vehicle.x_meas = x_meas
+        self.vehicle.y_meas = y_meas
+        self.vehicle.yaw_meas = yaw_meas
 
         if (
-            self.prev_odom_x is not None and
-            self.prev_odom_y is not None and
-            self.prev_odom_yaw is not None and
+            self.prev_x_meas is not None and
+            self.prev_y_meas is not None and
+            self.prev_yaw_meas is not None and
             self.prev_odom_time is not None
         ):
-            dt = t - self.prev_odom_time
+            dt = t_meas - self.prev_odom_time
 
             if dt > 1e-4:
-                vx_world = (x - self.prev_odom_x) / dt
-                vy_world = (y - self.prev_odom_y) / dt
+                vx_world = (x_meas - self.prev_x_meas) / dt
+                vy_world = (y_meas - self.prev_y_meas) / dt
 
-                dyaw = self.wrap_angle(yaw - self.prev_odom_yaw)
-                yaw_rate = dyaw / dt
+                dyaw = self.wrap_angle(yaw_meas - self.prev_yaw_meas)
+                r_recon = dyaw / dt
 
-                vx_body = math.cos(yaw) * vx_world + math.sin(yaw) * vy_world
-                vy_body = -math.sin(yaw) * vx_world + math.cos(yaw) * vy_world
+                vx_recon = math.cos(yaw_meas) * vx_world + math.sin(yaw_meas) * vy_world
+                vy_recon = -math.sin(yaw_meas) * vx_world + math.cos(yaw_meas) * vy_world
 
-                self.vehicle.vx = vx_body
-                self.vehicle.vy = vy_body
-                self.vehicle.yaw_rate = yaw_rate
+                self.vehicle.vx_recon = vx_recon
+                self.vehicle.vy_recon = vy_recon
+                self.vehicle.r_recon = r_recon
 
-        self.prev_odom_x = x
-        self.prev_odom_y = y
-        self.prev_odom_yaw = yaw
-        self.prev_odom_time = t
+        self.prev_x_meas = x_meas
+        self.prev_y_meas = y_meas
+        self.prev_yaw_meas = yaw_meas
+        self.prev_odom_time = t_meas
 
         self.vehicle.odom_ready = True
 
     def status_callback(self, message):
         """Stores battery / vehicle status signals for later MRAC use."""
-        fuel_percentage = getattr(message, 'fuel_percentage', None)
-        power = getattr(message, 'power', None)
+        fuel_percentage_meas = getattr(message, 'fuel_percentage', None)
+        power_meas = getattr(message, 'power', None)
 
-        self.vehicle.battery_pct = float(fuel_percentage) if fuel_percentage is not None else None
-        self.vehicle.battery_power = float(power) if power is not None else None
+        self.vehicle.battery_pct_meas = float(fuel_percentage_meas) if fuel_percentage_meas is not None else None
+        self.vehicle.battery_power_meas = float(power_meas) if power_meas is not None else None
         self.vehicle.status_ready = True
 
     def debug_timer_callback(self):
         """Prints the incoming MRAC-related measurements every 0.5 s."""
         if self.vehicle.odom_ready:
             if self.latest_camera_measurement.have_measurement:
-                ye_text = f"{self.latest_camera_measurement.ye:.3f}"
-                psi_text = f"{self.latest_camera_measurement.psi_rel:.3f}"
+                ye_text = f"{self.latest_camera_measurement.ye_cam_filt:.3f}"
+                psi_text = f"{self.latest_camera_measurement.psi_rel_cam_filt:.3f}"
             else:
                 ye_text = "None"
                 psi_text = "None"
 
             self.get_logger().info(
                 f"[MRAC scaffold] "
-                f"vx={self.vehicle.vx:.3f}, "
-                f"vy={self.vehicle.vy:.3f}, "
-                f"r={self.vehicle.yaw_rate:.3f}, "
-                f"x={self.vehicle.x:.3f}, "
-                f"y={self.vehicle.y:.3f}, "
-                f"ye={ye_text}, "
-                f"psi_rel={psi_text}, "
-                f"battery_pct={self.vehicle.battery_pct}, "
-                f"battery_power={self.vehicle.battery_power}"
+                f"x_meas={self.vehicle.x_meas:.3f}, "
+                f"y_meas={self.vehicle.y_meas:.3f}, "
+                f"yaw_meas={self.vehicle.yaw_meas:.3f}, "
+                f"vx_recon={self.vehicle.vx_recon:.3f}, "
+                f"vy_recon={self.vehicle.vy_recon:.3f}, "
+                f"r_recon={self.vehicle.r_recon:.3f}, "
+                f"ye_cam_filt={ye_text}, "
+                f"psi_rel_cam_filt={psi_text}, "
+                f"battery_pct_meas={self.vehicle.battery_pct_meas}, "
+                f"battery_power_meas={self.vehicle.battery_power_meas}"
             )
         else:
             self.get_logger().info("[MRAC scaffold] waiting for odometry...")

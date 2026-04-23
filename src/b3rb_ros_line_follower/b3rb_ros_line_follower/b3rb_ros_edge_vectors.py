@@ -33,10 +33,10 @@ BLUE_COLOR = (255, 0, 0)
 GREEN_COLOR = (0, 255, 0)
 YELLOW_COLOR = (0, 255, 255)
 
-#ignore tiny noisy contours
+# ignore tiny noisy contours
 VECTOR_MAGNITUDE_MINIMUM = 4.0
 
-#threshold / morphology
+# threshold / morphology
 THRESHOLD_BLACK = 90
 MORPH_KERNEL_SIZE = 5
 
@@ -62,7 +62,17 @@ BEV_VALID_TOP_RATIO = 0.12
 
 
 class EdgeVectorsPublisher(Node):
-    """Initializes edge vector publisher node with the required publishers and subscriptions."""
+    """
+    Publishes camera-derived edge-vector measurements.
+
+    Signal role:
+    - input  : compressed monocular camera image
+    - output : /edge_vectors
+
+    Important note:
+    These edge vectors are PERCEPTION-LAYER intermediate measurements.
+    They are not vehicle-state estimates like vx, vy, or yaw rate.
+    """
 
     def __init__(self):
         super().__init__('edge_vectors_publisher')
@@ -153,9 +163,9 @@ class EdgeVectorsPublisher(Node):
 
         return src, dst
 
-    def compute_bev_image(self, image):
+    def compute_bev_image(self, image_bgr_meas):
         """Applies bird's-eye-view perspective transform."""
-        height, width = image.shape[:2]
+        height, width = image_bgr_meas.shape[:2]
 
         src, dst = self.get_bev_points(width, height)
 
@@ -165,25 +175,26 @@ class EdgeVectorsPublisher(Node):
         source_mask = np.zeros((height, width), dtype=np.uint8)
         cv2.fillConvexPoly(source_mask, src.astype(np.int32), 255)
 
-        masked_image = cv2.bitwise_and(image, image, mask=source_mask)
+        masked_image = cv2.bitwise_and(image_bgr_meas, image_bgr_meas, mask=source_mask)
 
         bev_image = cv2.warpPerspective(masked_image, transform, (width, height))
         bev_mask = cv2.warpPerspective(source_mask, transform, (width, height))
 
         # original image with trapezoid drawn for debug
-        source_debug = image.copy()
+        source_debug = image_bgr_meas.copy()
         cv2.polylines(source_debug, [src.astype(np.int32)], True, YELLOW_COLOR, 2)
 
         return bev_image, bev_mask, source_debug
 
-    def compute_vectors_from_image(self, image, thresh):
+    def compute_vectors_from_image(self, debug_image_bgr, thresh_image_bin):
         """Creates candidate vectors from contours."""
-        contours = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+        contours = cv2.findContours(thresh_image_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
 
-        image_height, image_width = thresh.shape[:2]
+        image_height, image_width = thresh_image_bin.shape[:2]
         rover_point = np.array([image_width / 2.0, image_height - 1], dtype=np.float32)
 
-        vectors = []
+        candidate_vectors_cam_meas = []
+
         for contour in contours:
             coordinates = contour[:, 0, :]
 
@@ -211,11 +222,16 @@ class EdgeVectorsPublisher(Node):
             else:
                 max_y_coord[0] = np.max(max_y_coords[:, 0])
 
-            vectors.append([list(min_y_coord), list(max_y_coord), distance, magnitude])
+            candidate_vectors_cam_meas.append([
+                list(min_y_coord),
+                list(max_y_coord),
+                distance,
+                magnitude
+            ])
 
-            cv2.line(image, tuple(min_y_coord), tuple(max_y_coord), BLUE_COLOR, 2)
+            cv2.line(debug_image_bgr, tuple(min_y_coord), tuple(max_y_coord), BLUE_COLOR, 2)
 
-        return vectors, image
+        return candidate_vectors_cam_meas, debug_image_bgr
 
     def choose_best_vector(self, candidates):
         """Chooses the most useful vector on one side."""
@@ -225,83 +241,97 @@ class EdgeVectorsPublisher(Node):
         # prefer close vectors, but give some credit to longer ones
         return min(candidates, key=lambda v: (v[2] - 0.30 * v[3]))
 
-    def process_image_for_edge_vectors(self, image):
-        """Processes the image and creates vectors on the road edges using BEV."""
-        self.image_height, self.image_width, _ = image.shape
+    def process_image_for_edge_vectors(self, image_bgr_meas):
+        """
+        Processes the image and creates vectors on the road edges using BEV.
 
-        bev_image, bev_mask, source_debug = self.compute_bev_image(image)
+        Output meaning:
+        final_vectors_cam_meas is a camera-derived measurement-layer output.
+        """
+        self.image_height, self.image_width, _ = image_bgr_meas.shape
 
-        gray = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        bev_image_bgr, bev_mask_bin, source_debug_bgr = self.compute_bev_image(image_bgr_meas)
 
-        thresh = cv2.threshold(gray, THRESHOLD_BLACK, 255, cv2.THRESH_BINARY_INV)[1]
+        gray_bev = cv2.cvtColor(bev_image_bgr, cv2.COLOR_BGR2GRAY)
+        gray_bev = cv2.GaussianBlur(gray_bev, (5, 5), 0)
+
+        thresh_image_bin = cv2.threshold(gray_bev, THRESHOLD_BLACK, 255, cv2.THRESH_BINARY_INV)[1]
 
         # remove invalid warped area
-        thresh = cv2.bitwise_and(thresh, bev_mask)
+        thresh_image_bin = cv2.bitwise_and(thresh_image_bin, bev_mask_bin)
 
         kernel = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
 
         # close first to connect broken turn edges, then open to remove noise
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh_image_bin = cv2.morphologyEx(thresh_image_bin, cv2.MORPH_CLOSE, kernel)
+        thresh_image_bin = cv2.morphologyEx(thresh_image_bin, cv2.MORPH_OPEN, kernel)
 
         # keep mask enforced after morphology too
-        thresh = cv2.bitwise_and(thresh, bev_mask)
+        thresh_image_bin = cv2.bitwise_and(thresh_image_bin, bev_mask_bin)
 
         # ignore unstable top warped region
         valid_top = int(self.image_height * BEV_VALID_TOP_RATIO)
-        thresh[:valid_top, :] = 0
+        thresh_image_bin[:valid_top, :] = 0
 
-        vectors, debug_image = self.compute_vectors_from_image(bev_image.copy(), thresh)
+        candidate_vectors_cam_meas, debug_image_bgr = self.compute_vectors_from_image(
+            bev_image_bgr.copy(),
+            thresh_image_bin
+        )
 
         half_width = self.image_width / 2.0
-        vectors_left = [v for v in vectors if ((v[0][0] + v[1][0]) / 2.0) < half_width]
-        vectors_right = [v for v in vectors if ((v[0][0] + v[1][0]) / 2.0) >= half_width]
+        vectors_left = [
+            v for v in candidate_vectors_cam_meas
+            if ((v[0][0] + v[1][0]) / 2.0) < half_width
+        ]
+        vectors_right = [
+            v for v in candidate_vectors_cam_meas
+            if ((v[0][0] + v[1][0]) / 2.0) >= half_width
+        ]
 
-        final_vectors = []
+        final_vectors_cam_meas = []
 
         left_best = self.choose_best_vector(vectors_left)
         right_best = self.choose_best_vector(vectors_right)
 
         for best_vector in [left_best, right_best]:
             if best_vector is not None:
-                cv2.line(debug_image, tuple(best_vector[0]), tuple(best_vector[1]), GREEN_COLOR, 2)
-                final_vectors.append(best_vector[:2])
+                cv2.line(debug_image_bgr, tuple(best_vector[0]), tuple(best_vector[1]), GREEN_COLOR, 2)
+                final_vectors_cam_meas.append(best_vector[:2])
 
-        self.publish_debug_image(self.publisher_source_image, source_debug)
-        self.publish_debug_image(self.publisher_bev_image, bev_image)
-        self.publish_debug_image(self.publisher_thresh_image, thresh)
-        self.publish_debug_image(self.publisher_vector_image, debug_image)
+        self.publish_debug_image(self.publisher_source_image, source_debug_bgr)
+        self.publish_debug_image(self.publisher_bev_image, bev_image_bgr)
+        self.publish_debug_image(self.publisher_thresh_image, thresh_image_bin)
+        self.publish_debug_image(self.publisher_vector_image, debug_image_bgr)
 
-        return final_vectors
+        return final_vectors_cam_meas
 
     def camera_image_callback(self, message):
         """Analyzes the image received from /camera/image_raw/compressed to detect road edges."""
         np_arr = np.frombuffer(message.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        image_bgr_meas = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        if image is None:
+        if image_bgr_meas is None:
             return
 
-        vectors = self.process_image_for_edge_vectors(image)
+        final_vectors_cam_meas = self.process_image_for_edge_vectors(image_bgr_meas)
 
         vectors_message = EdgeVectors()
-        vectors_message.image_height = image.shape[0]
-        vectors_message.image_width = image.shape[1]
+        vectors_message.image_height = image_bgr_meas.shape[0]
+        vectors_message.image_width = image_bgr_meas.shape[1]
         vectors_message.vector_count = 0
 
-        if len(vectors) > 0:
-            vectors_message.vector_1[0].x = float(vectors[0][0][0])
-            vectors_message.vector_1[0].y = float(vectors[0][0][1])
-            vectors_message.vector_1[1].x = float(vectors[0][1][0])
-            vectors_message.vector_1[1].y = float(vectors[0][1][1])
+        if len(final_vectors_cam_meas) > 0:
+            vectors_message.vector_1[0].x = float(final_vectors_cam_meas[0][0][0])
+            vectors_message.vector_1[0].y = float(final_vectors_cam_meas[0][0][1])
+            vectors_message.vector_1[1].x = float(final_vectors_cam_meas[0][1][0])
+            vectors_message.vector_1[1].y = float(final_vectors_cam_meas[0][1][1])
             vectors_message.vector_count += 1
 
-        if len(vectors) > 1:
-            vectors_message.vector_2[0].x = float(vectors[1][0][0])
-            vectors_message.vector_2[0].y = float(vectors[1][0][1])
-            vectors_message.vector_2[1].x = float(vectors[1][1][0])
-            vectors_message.vector_2[1].y = float(vectors[1][1][1])
+        if len(final_vectors_cam_meas) > 1:
+            vectors_message.vector_2[0].x = float(final_vectors_cam_meas[1][0][0])
+            vectors_message.vector_2[0].y = float(final_vectors_cam_meas[1][0][1])
+            vectors_message.vector_2[1].x = float(final_vectors_cam_meas[1][1][0])
+            vectors_message.vector_2[1].y = float(final_vectors_cam_meas[1][1][1])
             vectors_message.vector_count += 1
 
         self.publisher_edge_vectors.publish(vectors_message)
