@@ -31,12 +31,34 @@ PI = math.pi
 RED_COLOR = (0, 0, 255)
 BLUE_COLOR = (255, 0, 0)
 GREEN_COLOR = (0, 255, 0)
-
-#slightly taller ROI so the car sees the turn after the ramp
-VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.58
+YELLOW_COLOR = (0, 255, 255)
 
 #ignore tiny noisy contours
-VECTOR_MAGNITUDE_MINIMUM = 5.0
+VECTOR_MAGNITUDE_MINIMUM = 4.0
+
+#threshold / morphology
+THRESHOLD_BLACK = 90
+MORPH_KERNEL_SIZE = 5
+
+# =========================
+#   BIRD'S-EYE VIEW SETUP
+# =========================
+
+# vertical placement of the trapezoid in the ORIGINAL image
+BEV_TOP_Y_RATIO = 0.48
+BEV_BOTTOM_Y_RATIO = 0.98
+
+# half-widths of the source trapezoid in the ORIGINAL image
+# expressed as fractions of full image width
+BEV_TOP_HALF_WIDTH_RATIO = 0.22
+BEV_BOTTOM_HALF_WIDTH_RATIO = 0.52
+
+# destination rectangle horizontal margins in the BEV image
+BEV_DST_LEFT_RATIO = 0.12
+BEV_DST_RIGHT_RATIO = 0.88
+
+# after BEV, ignore the unstable top region
+BEV_VALID_TOP_RATIO = 0.12
 
 
 class EdgeVectorsPublisher(Node):
@@ -70,10 +92,20 @@ class EdgeVectorsPublisher(Node):
             QOS_PROFILE_DEFAULT
         )
 
+        self.publisher_bev_image = self.create_publisher(
+            CompressedImage,
+            '/debug_images/bev_image',
+            QOS_PROFILE_DEFAULT
+        )
+
+        self.publisher_source_image = self.create_publisher(
+            CompressedImage,
+            '/debug_images/bev_source_image',
+            QOS_PROFILE_DEFAULT
+        )
+
         self.image_height = 0
         self.image_width = 0
-        self.lower_image_height = 0
-        self.upper_image_height = 0
 
     def publish_debug_image(self, publisher, image):
         """Publishes images for debugging purposes."""
@@ -92,9 +124,64 @@ class EdgeVectorsPublisher(Node):
             theta = math.atan(slope)
         return theta
 
+    def get_bev_points(self, width, height):
+        """Builds source trapezoid and destination rectangle for BEV."""
+        cx = width / 2.0
+
+        top_y = int(height * BEV_TOP_Y_RATIO)
+        bottom_y = int(height * BEV_BOTTOM_Y_RATIO)
+
+        top_half_width = int(width * BEV_TOP_HALF_WIDTH_RATIO)
+        bottom_half_width = int(width * BEV_BOTTOM_HALF_WIDTH_RATIO)
+
+        src = np.float32([
+            [cx - top_half_width, top_y],         # top-left
+            [cx + top_half_width, top_y],         # top-right
+            [cx + bottom_half_width, bottom_y],   # bottom-right
+            [cx - bottom_half_width, bottom_y],   # bottom-left
+        ])
+
+        dst_left = int(width * BEV_DST_LEFT_RATIO)
+        dst_right = int(width * BEV_DST_RIGHT_RATIO)
+
+        dst = np.float32([
+            [dst_left, 0],            # top-left
+            [dst_right, 0],           # top-right
+            [dst_right, height - 1],  # bottom-right
+            [dst_left, height - 1],   # bottom-left
+        ])
+
+        return src, dst
+
+    def compute_bev_image(self, image):
+        """Applies bird's-eye-view perspective transform."""
+        height, width = image.shape[:2]
+
+        src, dst = self.get_bev_points(width, height)
+
+        transform = cv2.getPerspectiveTransform(src, dst)
+
+        # mask only the source trapezoid before warp
+        source_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillConvexPoly(source_mask, src.astype(np.int32), 255)
+
+        masked_image = cv2.bitwise_and(image, image, mask=source_mask)
+
+        bev_image = cv2.warpPerspective(masked_image, transform, (width, height))
+        bev_mask = cv2.warpPerspective(source_mask, transform, (width, height))
+
+        # original image with trapezoid drawn for debug
+        source_debug = image.copy()
+        cv2.polylines(source_debug, [src.astype(np.int32)], True, YELLOW_COLOR, 2)
+
+        return bev_image, bev_mask, source_debug
+
     def compute_vectors_from_image(self, image, thresh):
         """Creates candidate vectors from contours."""
         contours = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+
+        image_height, image_width = thresh.shape[:2]
+        rover_point = np.array([image_width / 2.0, image_height - 1], dtype=np.float32)
 
         vectors = []
         for contour in contours:
@@ -113,12 +200,12 @@ class EdgeVectorsPublisher(Node):
             if magnitude <= VECTOR_MAGNITUDE_MINIMUM:
                 continue
 
-            rover_point = [self.image_width / 2, self.lower_image_height]
-            middle_point = (min_y_coord + max_y_coord) / 2
+            middle_point = (min_y_coord + max_y_coord) / 2.0
             distance = np.linalg.norm(middle_point - rover_point)
 
             angle = self.get_vector_angle_in_radians([min_y_coord, max_y_coord])
 
+            # make endpoint choice more stable
             if angle > 0:
                 min_y_coord[0] = np.max(min_y_coords[:, 0])
             else:
@@ -135,27 +222,37 @@ class EdgeVectorsPublisher(Node):
         if len(candidates) == 0:
             return None
 
-        #prefer close vectors, but give some credit to longer ones
+        # prefer close vectors, but give some credit to longer ones
         return min(candidates, key=lambda v: (v[2] - 0.30 * v[3]))
 
     def process_image_for_edge_vectors(self, image):
-        """Processes the image and creates vectors on the road edges."""
+        """Processes the image and creates vectors on the road edges using BEV."""
         self.image_height, self.image_width, _ = image.shape
-        self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
-        self.upper_image_height = int(self.image_height - self.lower_image_height)
 
-        roi = image[self.image_height - self.lower_image_height:]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        bev_image, bev_mask, source_debug = self.compute_bev_image(image)
+
+        gray = cv2.cvtColor(bev_image, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        threshold_black = 90
-        thresh = cv2.threshold(gray, threshold_black, 255, cv2.THRESH_BINARY_INV)[1]
+        thresh = cv2.threshold(gray, THRESHOLD_BLACK, 255, cv2.THRESH_BINARY_INV)[1]
 
-        kernel = np.ones((3, 3), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        # remove invalid warped area
+        thresh = cv2.bitwise_and(thresh, bev_mask)
+
+        kernel = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
+
+        # close first to connect broken turn edges, then open to remove noise
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-        vectors, debug_image = self.compute_vectors_from_image(roi.copy(), thresh)
+        # keep mask enforced after morphology too
+        thresh = cv2.bitwise_and(thresh, bev_mask)
+
+        # ignore unstable top warped region
+        valid_top = int(self.image_height * BEV_VALID_TOP_RATIO)
+        thresh[:valid_top, :] = 0
+
+        vectors, debug_image = self.compute_vectors_from_image(bev_image.copy(), thresh)
 
         half_width = self.image_width / 2.0
         vectors_left = [v for v in vectors if ((v[0][0] + v[1][0]) / 2.0) < half_width]
@@ -169,10 +266,10 @@ class EdgeVectorsPublisher(Node):
         for best_vector in [left_best, right_best]:
             if best_vector is not None:
                 cv2.line(debug_image, tuple(best_vector[0]), tuple(best_vector[1]), GREEN_COLOR, 2)
-                best_vector[0][1] += self.upper_image_height
-                best_vector[1][1] += self.upper_image_height
                 final_vectors.append(best_vector[:2])
 
+        self.publish_debug_image(self.publisher_source_image, source_debug)
+        self.publish_debug_image(self.publisher_bev_image, bev_image)
         self.publish_debug_image(self.publisher_thresh_image, thresh)
         self.publish_debug_image(self.publisher_vector_image, debug_image)
 
