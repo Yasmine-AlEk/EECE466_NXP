@@ -68,6 +68,23 @@ MAX_CENTER_JUMP_RATIO = 0.16
 CENTER_FILTER_ALPHA_TWO_EDGES = 0.30
 CENTER_FILTER_ALPHA_ONE_EDGE = 0.20
 
+# ============================================================
+# KINEMATIC BICYCLE SETTINGS
+# ------------------------------------------------------------
+# These are based on the teammate hardware bicycle model node:
+# wheelbase = 0.168 m
+# max steer = 30 deg
+# low-speed deadzone = 0.05 m/s
+#
+# For the report's IV-A beta-based kinematic model, we split
+# the wheelbase equally because lf/lr are not yet identified.
+# ============================================================
+KINEMATIC_WHEELBASE_M = 0.168
+KINEMATIC_LF_M = 0.5 * KINEMATIC_WHEELBASE_M
+KINEMATIC_LR_M = 0.5 * KINEMATIC_WHEELBASE_M
+KINEMATIC_MAX_STEER_RAD = math.radians(30.0)
+KINEMATIC_V_DEADZONE_MS = 0.05
+
 # ==========================================
 # SIGNAL NAMING CONVENTION
 # ------------------------------------------
@@ -78,25 +95,26 @@ CENTER_FILTER_ALPHA_ONE_EDGE = 0.20
 #
 # Examples:
 # x_meas, y_meas, yaw_meas
-# vx_recon, vy_recon, r_recon
+# vx_recon, vy_recon, r_recon, a_long_recon
 # ye_cam_filt, psi_rel_cam_filt
-# delta_f_est, bbatt_est
+# delta_f_cmd_est, beta_kin_est
 # ==========================================
 
 
 @dataclass
 class VehicleSignals:
-    # Direct odometry pose measurements
+    # direct odometry pose measurements
     x_meas: float = 0.0
     y_meas: float = 0.0
     yaw_meas: float = 0.0
 
-    # Reconstructed body-frame states from odometry pose differences
+    # reconstructed body-frame states from odometry pose differences
     vx_recon: float = 0.0
     vy_recon: float = 0.0
     r_recon: float = 0.0
+    a_long_recon: float = 0.0
 
-    # Direct status measurements
+    # direct status measurements
     battery_pct_meas: Optional[float] = None
     battery_power_meas: Optional[float] = None
 
@@ -110,9 +128,96 @@ class CameraMeasurement:
     use_integral: bool = False
     vector_count: int = 0
 
-    # Camera-derived filtered measurement-layer outputs
+    # camera-derived filtered measurement-layer outputs
     ye_cam_filt: float = 0.0
     psi_rel_cam_filt: float = 0.0
+
+
+@dataclass
+class KinematicBicycleState:
+    x: float = 0.0
+    y: float = 0.0
+    psi: float = 0.0
+    v: float = 0.0
+
+
+@dataclass
+class KinematicBicycleDerivative:
+    beta: float = 0.0
+    x_dot: float = 0.0
+    y_dot: float = 0.0
+    psi_dot: float = 0.0
+    v_dot: float = 0.0
+
+
+class KinematicBicycleModel:
+    """
+    Report IV-A style kinematic bicycle model:
+
+        beta    = atan( lr / (lf + lr) * tan(delta_f) )
+        x_dot   = v * cos(psi + beta)
+        y_dot   = v * sin(psi + beta)
+        psi_dot = (v / lr) * sin(beta)
+        v_dot   = a_long
+    """
+
+    def __init__(self, lf_m: float, lr_m: float):
+        self.lf_m = lf_m
+        self.lr_m = lr_m
+
+    @staticmethod
+    def wrap_angle(angle_rad: float) -> float:
+        return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+    def compute_beta(self, delta_f_rad: float) -> float:
+        wheelbase_m = self.lf_m + self.lr_m
+        if wheelbase_m <= 1e-9:
+            return 0.0
+        return math.atan((self.lr_m / wheelbase_m) * math.tan(delta_f_rad))
+
+    def derivative(
+        self,
+        state: KinematicBicycleState,
+        delta_f_rad: float,
+        a_long_ms2: float
+    ) -> KinematicBicycleDerivative:
+        beta_rad = self.compute_beta(delta_f_rad)
+
+        x_dot = state.v * math.cos(state.psi + beta_rad)
+        y_dot = state.v * math.sin(state.psi + beta_rad)
+
+        if self.lr_m <= 1e-9:
+            psi_dot = 0.0
+        else:
+            psi_dot = (state.v / self.lr_m) * math.sin(beta_rad)
+
+        v_dot = a_long_ms2
+
+        return KinematicBicycleDerivative(
+            beta=beta_rad,
+            x_dot=x_dot,
+            y_dot=y_dot,
+            psi_dot=psi_dot,
+            v_dot=v_dot
+        )
+
+    def step_euler(
+        self,
+        state: KinematicBicycleState,
+        delta_f_rad: float,
+        a_long_ms2: float,
+        dt_s: float
+    ):
+        deriv = self.derivative(state, delta_f_rad, a_long_ms2)
+
+        next_state = KinematicBicycleState(
+            x=state.x + deriv.x_dot * dt_s,
+            y=state.y + deriv.y_dot * dt_s,
+            psi=self.wrap_angle(state.psi + deriv.psi_dot * dt_s),
+            v=max(0.0, state.v + deriv.v_dot * dt_s)
+        )
+
+        return next_state, deriv
 
 
 class LineFollower(Node):
@@ -192,6 +297,23 @@ class LineFollower(Node):
         self.prev_y_meas = None
         self.prev_yaw_meas = None
         self.prev_odom_time = None
+        self.prev_vx_recon = None
+
+        # =========================
+        # kinematic bicycle model
+        # =========================
+        self.kinematic_model = KinematicBicycleModel(
+            lf_m=KINEMATIC_LF_M,
+            lr_m=KINEMATIC_LR_M
+        )
+
+        self.kinematic_state_est = None
+        self.latest_kinematic_derivative = None
+
+        # model-aligned estimated inputs
+        self.delta_f_cmd_est = 0.0
+        self.a_long_cmd_est = 0.0
+        self.last_valid_delta_f_cmd_est = 0.0
 
     def clamp(self, value, min_value, max_value):
         """Clamps value into [min_value, max_value]."""
@@ -250,6 +372,64 @@ class LineFollower(Node):
     def wrap_angle(self, angle):
         """Wrap angle to [-pi, pi]."""
         return math.atan2(math.sin(angle), math.cos(angle))
+
+    def turn_cmd_to_delta_f_est(self, turn_cmd: float) -> float:
+        """
+        Map normalized steering command [-1, 1] to approximate front-wheel
+        steering angle [rad], aligned with the hardware bicycle node's
+        normalized steering convention.
+        """
+        turn_cmd = self.clamp(turn_cmd, -1.0, 1.0)
+        return turn_cmd * KINEMATIC_MAX_STEER_RAD
+
+    def update_kinematic_bicycle_model(self, dt_s: float):
+        """
+        Runs the kinematic bicycle model in parallel with the controller.
+
+        To stay compatible with the hardware bicycle-node conventions:
+        - use the same wheelbase / steering-limit scale
+        - hold last valid delta when |v| is below the deadzone
+        - use reconstructed forward speed and acceleration from odometry
+        """
+        if not self.vehicle.odom_ready:
+            return
+
+        speed_for_model = self.vehicle.vx_recon
+        delta_candidate = self.turn_cmd_to_delta_f_est(self.last_turn_cmd)
+
+        # mimic teammate hardware behavior: when speed is too low,
+        # hold last valid steering angle
+        if abs(speed_for_model) < KINEMATIC_V_DEADZONE_MS:
+            speed_for_model = 0.0
+            self.delta_f_cmd_est = self.last_valid_delta_f_cmd_est
+        else:
+            self.delta_f_cmd_est = delta_candidate
+            self.last_valid_delta_f_cmd_est = delta_candidate
+
+        self.a_long_cmd_est = self.vehicle.a_long_recon
+
+        measured_state = KinematicBicycleState(
+            x=self.vehicle.x_meas,
+            y=self.vehicle.y_meas,
+            psi=self.vehicle.yaw_meas,
+            v=max(0.0, speed_for_model)
+        )
+
+        self.latest_kinematic_derivative = self.kinematic_model.derivative(
+            state=measured_state,
+            delta_f_rad=self.delta_f_cmd_est,
+            a_long_ms2=self.a_long_cmd_est
+        )
+
+        if self.kinematic_state_est is None:
+            self.kinematic_state_est = measured_state
+        else:
+            self.kinematic_state_est, _ = self.kinematic_model.step_euler(
+                state=self.kinematic_state_est,
+                delta_f_rad=self.delta_f_cmd_est,
+                a_long_ms2=self.a_long_cmd_est,
+                dt_s=dt_s
+            )
 
     def extract_camera_measurement(self, vectors, half_width):
         """
@@ -355,7 +535,7 @@ class LineFollower(Node):
         """Uses camera measurements to compute speed and turn."""
         vectors = message
         half_width = vectors.image_width / 2.0 if vectors.image_width > 0 else 1.0
-        dt = self.get_dt()
+        dt_s = self.get_dt()
 
         raw_turn_cmd = self.last_turn_cmd
         target_speed_cmd = SPEED_SEARCH
@@ -367,7 +547,7 @@ class LineFollower(Node):
             psi_rel_cam_filt = camera.psi_rel_cam_filt
 
             if camera.use_integral:
-                self.center_error_integral += ye_cam_filt * dt
+                self.center_error_integral += ye_cam_filt * dt_s
                 self.center_error_integral = self.clamp(
                     self.center_error_integral,
                     -INTEGRAL_LIMIT,
@@ -376,7 +556,7 @@ class LineFollower(Node):
             else:
                 self.center_error_integral *= 0.90
 
-            center_error_derivative = (ye_cam_filt - self.prev_center_error) / dt
+            center_error_derivative = (ye_cam_filt - self.prev_center_error) / dt_s
             self.prev_center_error = ye_cam_filt
 
             raw_turn_cmd = (
@@ -431,6 +611,9 @@ class LineFollower(Node):
         self.last_turn_cmd = turn_cmd
         self.last_speed_cmd = speed_cmd
 
+        # run the kinematic bicycle model in parallel for validation
+        self.update_kinematic_bicycle_model(dt_s)
+
         self.rover_move_manual_mode(speed_cmd, turn_cmd)
 
     def odometry_callback(self, message):
@@ -441,7 +624,7 @@ class LineFollower(Node):
         - x_meas, y_meas, yaw_meas
 
         Reconstructed from pose differences:
-        - vx_recon, vy_recon, r_recon
+        - vx_recon, vy_recon, r_recon, a_long_recon
         """
         x_meas = float(message.pose.pose.position.x)
         y_meas = float(message.pose.pose.position.y)
@@ -459,21 +642,29 @@ class LineFollower(Node):
             self.prev_yaw_meas is not None and
             self.prev_odom_time is not None
         ):
-            dt = t_meas - self.prev_odom_time
+            dt_s = t_meas - self.prev_odom_time
 
-            if dt > 1e-4:
-                vx_world = (x_meas - self.prev_x_meas) / dt
-                vy_world = (y_meas - self.prev_y_meas) / dt
+            if dt_s > 1e-4:
+                vx_world = (x_meas - self.prev_x_meas) / dt_s
+                vy_world = (y_meas - self.prev_y_meas) / dt_s
 
                 dyaw = self.wrap_angle(yaw_meas - self.prev_yaw_meas)
-                r_recon = dyaw / dt
+                r_recon = dyaw / dt_s
 
                 vx_recon = math.cos(yaw_meas) * vx_world + math.sin(yaw_meas) * vy_world
                 vy_recon = -math.sin(yaw_meas) * vx_world + math.cos(yaw_meas) * vy_world
 
+                if self.prev_vx_recon is None:
+                    a_long_recon = 0.0
+                else:
+                    a_long_recon = (vx_recon - self.prev_vx_recon) / dt_s
+
                 self.vehicle.vx_recon = vx_recon
                 self.vehicle.vy_recon = vy_recon
                 self.vehicle.r_recon = r_recon
+                self.vehicle.a_long_recon = a_long_recon
+
+                self.prev_vx_recon = vx_recon
 
         self.prev_x_meas = x_meas
         self.prev_y_meas = y_meas
@@ -501,6 +692,30 @@ class LineFollower(Node):
                 ye_text = "None"
                 psi_text = "None"
 
+            if self.latest_kinematic_derivative is not None:
+                beta_text = f"{self.latest_kinematic_derivative.beta:.3f}"
+                xdot_text = f"{self.latest_kinematic_derivative.x_dot:.3f}"
+                ydot_text = f"{self.latest_kinematic_derivative.y_dot:.3f}"
+                psidot_text = f"{self.latest_kinematic_derivative.psi_dot:.3f}"
+                vdot_text = f"{self.latest_kinematic_derivative.v_dot:.3f}"
+            else:
+                beta_text = "None"
+                xdot_text = "None"
+                ydot_text = "None"
+                psidot_text = "None"
+                vdot_text = "None"
+
+            if self.kinematic_state_est is not None:
+                kin_x_text = f"{self.kinematic_state_est.x:.3f}"
+                kin_y_text = f"{self.kinematic_state_est.y:.3f}"
+                kin_psi_text = f"{self.kinematic_state_est.psi:.3f}"
+                kin_v_text = f"{self.kinematic_state_est.v:.3f}"
+            else:
+                kin_x_text = "None"
+                kin_y_text = "None"
+                kin_psi_text = "None"
+                kin_v_text = "None"
+
             self.get_logger().info(
                 f"[MRAC scaffold] "
                 f"x_meas={self.vehicle.x_meas:.3f}, "
@@ -509,8 +724,19 @@ class LineFollower(Node):
                 f"vx_recon={self.vehicle.vx_recon:.3f}, "
                 f"vy_recon={self.vehicle.vy_recon:.3f}, "
                 f"r_recon={self.vehicle.r_recon:.3f}, "
+                f"a_long_recon={self.vehicle.a_long_recon:.3f}, "
                 f"ye_cam_filt={ye_text}, "
                 f"psi_rel_cam_filt={psi_text}, "
+                f"delta_f_cmd_est={self.delta_f_cmd_est:.3f}, "
+                f"beta_kin={beta_text}, "
+                f"x_dot_kin={xdot_text}, "
+                f"y_dot_kin={ydot_text}, "
+                f"psi_dot_kin={psidot_text}, "
+                f"v_dot_kin={vdot_text}, "
+                f"kin_x_est={kin_x_text}, "
+                f"kin_y_est={kin_y_text}, "
+                f"kin_psi_est={kin_psi_text}, "
+                f"kin_v_est={kin_v_text}, "
                 f"battery_pct_meas={self.vehicle.battery_pct_meas}, "
                 f"battery_power_meas={self.vehicle.battery_power_meas}"
             )
