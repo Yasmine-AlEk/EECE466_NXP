@@ -30,6 +30,7 @@ setup(
             "nxp_track_vision       = nxp_cup_hw.Vision.vision_chain:main",
             "nxp_cam_init           = nxp_cup_hw.Vision.vision_basic:main",
             "nxp_bicycle_model_node = nxp_cup_hw.Models.bicycle:main",
+            "vision_stream          = nxp_cup_hw.Vision.vision_stream:main",
         ],
     },
 )

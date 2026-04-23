@@ -1,37 +1,13 @@
 #!/usr/bin/env python3
 """
-NXP Cup – Lane Chain Viewer
-============================
-Subscribes to the topics published by nxp_track_vision.py and streams
-a rendered visualisation over MJPEG HTTP so you can watch it in any
-browser over SSH — no display, no X11 needed.
-
-Subscriptions
--------------
-  /nxp_cup/lane_chains    std_msgs/String   JSON chain data  (primary)
-  /nxp_cup/debug_image    sensor_msgs/Image raw BEV debug frame (optional)
-
-MJPEG stream
-------------
-  http://<navqplus-ip>:8081          main rendered view
-  http://<navqplus-ip>:8081/raw      raw debug_image from vision node
-  http://<navqplus-ip>:8081/both     side-by-side rendered + raw
-
-Run
----
-  source /opt/ros/humble/setup.bash
-  python3 nxp_chain_viewer.py [--port 8081] [--no-raw]
-
-  --port      HTTP port (default 8081, so it doesn't clash with vision node)
-  --no-raw    Don't subscribe to debug_image (saves bandwidth)
-  --scale N   Scale factor for rendered canvas (default 2 → 800×600)
+NXP Cup – Vision Stream Dashboard
+===================================
+2x2 grid: camera+chains | IMU plots | odometry plots | encoder plots
+http://<navqplus-ip>:8081
 """
 
-import argparse
-import json
-import sys
-import threading
-import time
+import argparse, json, math, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import cv2
 import numpy as np
@@ -39,475 +15,333 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
-    from std_msgs.msg import String
-    from sensor_msgs.msg import Image
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+    from std_msgs.msg import String, Int32MultiArray
+    from nav_msgs.msg import Odometry
+    from sensor_msgs.msg import Imu, Image
     from cv_bridge import CvBridge
-    _ROS_OK = True
 except ImportError:
-    print("[ERROR] rclpy not found. Source your ROS 2 workspace first:")
-    print("        source /opt/ros/humble/setup.bash")
+    print("[ERROR] source /opt/ros/humble/setup.bash first")
     sys.exit(1)
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+DEFAULT_PORT  = 8081
+DEFAULT_SCALE = 2
+JPEG_QUALITY  = 75
+BEV_W, BEV_H  = 400, 300
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Shared state ──────────────────────────────────────────────────────────────
 
-DEFAULT_PORT   = 8081
-DEFAULT_SCALE  = 2          # rendered canvas = BEV dims × this factor
-JPEG_QUALITY   = 72
-STALE_TIMEOUT  = 2.0        # seconds before "NO SIGNAL" overlay appears
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SHARED STATE  (written by ROS callbacks, read by HTTP threads)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _FrameSlot:
-    """Lock-free latest-frame store with sequence number for polling."""
+class _Slot:
     def __init__(self):
         self._lock = threading.Lock()
         self._jpg  = b""
         self._seq  = 0
-
-    def push(self, jpg: bytes):
+    def push(self, jpg):
         with self._lock:
-            self._jpg  = jpg
+            self._jpg = jpg
             self._seq += 1
-
-    def get_if_newer(self, last_seq):
+    def get_if_newer(self, s):
         with self._lock:
-            if self._seq != last_seq:
+            if self._seq != s:
                 return self._seq, self._jpg
-        return last_seq, None
+        return s, None
 
+_slot_cam      = _Slot()
+_enc           = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+_frame_lock    = threading.Lock()
+_latest_frame  = None
+_chain_lock    = threading.Lock()
+_latest_chains = None
+_sensor_lock   = threading.Lock()
+_imu_data      = None
+_odom_data     = None
+_ticks_data    = None
 
-_slot_rendered = _FrameSlot()   # rendered chain visualisation
-_slot_raw      = _FrameSlot()   # raw debug_image from vision node
-_slot_both     = _FrameSlot()   # side-by-side
+C_LEFT     = (80,  80,  255)
+C_RIGHT    = (80,  200,  80)
+C_CENTER   = (255, 180,   0)
+C_CROSSLINK= (100, 100, 100)
+C_CORRIDOR = (40,   80,  40)
+C_DOT_L    = (140, 140, 255)
+C_DOT_R    = (140, 255, 140)
+C_TEXT     = (220, 220, 220)
 
-_enc = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+# ── Camera frame builder ──────────────────────────────────────────────────────
 
-_last_chain_t  = 0.0            # epoch time of last /lane_chains message
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  RENDERER
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Colours
-C_BG         = (18,  18,  18)
-C_GRID       = (40,  40,  40)
-C_LEFT       = (80,  80,  255)    # blue
-C_RIGHT      = (80,  200, 80)     # green  (different from vision node so it's clear)
-C_CENTER     = (255, 180, 0)      # amber
-C_CROSSLINK  = (80,  80,  80)
-C_CORRIDOR   = (40,  60,  40)
-C_DOT_L      = (140, 140, 255)
-C_DOT_R      = (140, 255, 140)
-C_TEXT       = (220, 220, 220)
-C_WARN       = (0,   60,  200)
-
-
-def _pt(x, y, bev_w, bev_h, canvas_w, canvas_h):
-    """Map BEV pixel coords to canvas pixel coords."""
-    cx = int(x / bev_w * canvas_w)
-    cy = int(y / bev_h * canvas_h)
-    return (cx, cy)
-
-
-def render_chains(data: dict, canvas_w: int, canvas_h: int) -> np.ndarray:
-    """
-    Draw a clean bird's-eye visualisation of the lane chain data.
-
-    Layout (canvas, origin top-left, y grows downward):
-        bottom = nearest to car
-        top    = farthest ahead
-    """
-    bev_w = data.get("bev_w", 400)
-    bev_h = data.get("bev_h", 300)
-
-    canvas = np.full((canvas_h, canvas_w, 3), C_BG, dtype=np.uint8)
-
-    def p(x, y):
-        return _pt(x, y, bev_w, bev_h, canvas_w, canvas_h)
-
-    # ── Grid ─────────────────────────────────────────────────────────────────
-    n_strips = data.get("n_strips", 24)
-    for i in range(n_strips + 1):
-        y = int(i / n_strips * canvas_h)
-        cv2.line(canvas, (0, y), (canvas_w, y), C_GRID, 1)
-    for col in range(0, canvas_w, canvas_w // 8):
-        cv2.line(canvas, (col, 0), (col, canvas_h), C_GRID, 1)
-
-    # Car position indicator at the bottom
-    car_x = canvas_w // 2
-    cv2.arrowedLine(canvas,
-                    (car_x, canvas_h - 4),
-                    (car_x, canvas_h - 28),
-                    (180, 180, 180), 2, tipLength=0.4)
-    cv2.putText(canvas, "CAR", (car_x - 16, canvas_h - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1)
-
+def overlay_chains(canvas, data, bev_w, bev_h):
+    cw, ch = canvas.shape[1], canvas.shape[0]
+    def p(x, y): return (int(x/bev_w*cw), int(y/bev_h*ch))
     left   = [tuple(pt) for pt in data.get("left",   [])]
     right  = [tuple(pt) for pt in data.get("right",  [])]
     center = [tuple(pt) for pt in data.get("center", [])]
-
-    # ── Corridor fill ─────────────────────────────────────────────────────────
     if len(left) > 1 and len(right) > 1:
-        poly = (
-            [p(x, y) for x, y in left] +
-            [p(x, y) for x, y in reversed(right)]
-        )
-        overlay = canvas.copy()
-        cv2.fillPoly(overlay, [np.array(poly, dtype=np.int32)], C_CORRIDOR)
-        canvas = cv2.addWeighted(canvas, 0.6, overlay, 0.4, 0)
-
-    # ── Cross-links (depth alignment between left and right) ─────────────────
-    # Re-derive raw pairs from the original strip data embedded in JSON.
-    # Since we only have the simplified chains, we draw cross-links between
-    # nearest-neighbour pairs by matching y-coordinate.
-    def nearest(chain, y_target):
-        if not chain:
-            return None
-        return min(chain, key=lambda pt: abs(pt[1] - y_target))
-
+        poly = [p(x,y) for x,y in left] + [p(x,y) for x,y in reversed(right)]
+        ov = canvas.copy()
+        cv2.fillPoly(ov, [np.array(poly, dtype=np.int32)], C_CORRIDOR)
+        canvas = cv2.addWeighted(canvas, 0.55, ov, 0.45, 0)
+    n = data.get("n_strips", 24)
     if left and right:
-        sample_ys = np.linspace(0, bev_h, n_strips, endpoint=False)
-        for sy in sample_ys:
-            lp = nearest(left,  sy)
-            rp = nearest(right, sy)
-            if lp and rp:
-                cv2.line(canvas, p(*lp), p(*rp), C_CROSSLINK, 1)
-
-    # ── Chains ────────────────────────────────────────────────────────────────
-    def draw_chain(chain, col_line, col_dot, thickness=2):
-        pts = [p(x, y) for x, y in chain]
-        for i in range(1, len(pts)):
-            cv2.line(canvas, pts[i - 1], pts[i], col_line, thickness, cv2.LINE_AA)
-        for pt in pts:
-            cv2.circle(canvas, pt, 5, col_dot, -1)
-
-    draw_chain(left,   C_LEFT,   C_DOT_L)
-    draw_chain(right,  C_RIGHT,  C_DOT_R)
-    draw_chain(center, C_CENTER, C_CENTER, thickness=2)
-
-    # Direction arrows along centre path
-    if len(center) >= 2:
-        step = max(1, len(center) // 6)
-        for i in range(0, len(center) - 1, step):
-            cv2.arrowedLine(canvas,
-                            p(*center[i]), p(*center[i + 1]),
-                            C_CENTER, 1, tipLength=0.4)
-
-    # ── HUD ──────────────────────────────────────────────────────────────────
-    valid  = data.get("valid", {})
-    area   = data.get("corridor_area", 0)
-    stamp  = data.get("stamp", 0)
-    age    = time.time() - stamp if stamp else 0
-
-    hud = [
-        f"LEFT  {len(left):>2} pts  {'OK' if valid.get('left')  else 'MISSING'}",
-        f"RIGHT {len(right):>2} pts  {'OK' if valid.get('right') else 'MISSING'}",
-        f"CTR   {len(center):>2} pts",
-        f"Corridor {int(area)} px",
-        f"Msg age  {age*1000:.0f} ms",
+        def near(c, yt): return min(c, key=lambda pt: abs(pt[1]-yt))
+        for sy in np.linspace(0, bev_h, n, endpoint=False):
+            cv2.line(canvas, p(*near(left,sy)), p(*near(right,sy)), C_CROSSLINK, 1)
+    def draw(chain, cl, cd, t=2):
+        pts = [p(x,y) for x,y in chain]
+        for i in range(1, len(pts)): cv2.line(canvas, pts[i-1], pts[i], cl, t, cv2.LINE_AA)
+        for pt in pts: cv2.circle(canvas, pt, 4, cd, -1)
+    draw(left,   C_LEFT,   C_DOT_L)
+    draw(right,  C_RIGHT,  C_DOT_R)
+    draw(center, C_CENTER, C_CENTER, 2)
+    valid = data.get("valid", {})
+    age   = (time.time()-data["stamp"])*1000 if data.get("stamp") else 0
+    hud   = [
+        f"L {len(left):>2}pts {'OK' if valid.get('left') else '--'}  R {len(right):>2}pts {'OK' if valid.get('right') else '--'}  C {len(center):>2}pts",
+        f"Corridor {int(data.get('corridor_area',0))}px  age {age:.0f}ms",
     ]
-    for i, txt in enumerate(hud):
-        col = (80, 200, 80) if "OK" in txt else C_TEXT
-        cv2.putText(canvas, txt, (8, 18 + i * 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, col, 1, cv2.LINE_AA)
-
-    # Legend
-    legend = [
-        (C_LEFT,   "Left chain"),
-        (C_RIGHT,  "Right chain"),
-        (C_CENTER, "Centre path"),
-    ]
-    for i, (col, label) in enumerate(legend):
-        x0 = canvas_w - 130
-        y0 = 18 + i * 18
-        cv2.line(canvas, (x0, y0 - 4), (x0 + 20, y0 - 4), col, 2)
-        cv2.putText(canvas, label, (x0 + 26, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1, cv2.LINE_AA)
-
+    for i, t in enumerate(hud):
+        cv2.putText(canvas, t, (6, 15+i*15), cv2.FONT_HERSHEY_SIMPLEX, 0.40, C_TEXT, 1, cv2.LINE_AA)
     return canvas
 
-
-def no_signal_frame(canvas_w, canvas_h, reason="Waiting for /nxp_cup/lane_chains …"):
-    canvas = np.full((canvas_h, canvas_w, 3), (10, 10, 30), dtype=np.uint8)
-    cv2.putText(canvas, "NO SIGNAL", (canvas_w // 2 - 90, canvas_h // 2 - 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, C_WARN, 2, cv2.LINE_AA)
-    cv2.putText(canvas, reason, (canvas_w // 2 - 200, canvas_h // 2 + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (120, 120, 180), 1, cv2.LINE_AA)
+def build_cam_frame(canvas_w, canvas_h):
+    with _frame_lock: raw = _latest_frame
+    canvas = cv2.resize(raw, (canvas_w, canvas_h)) if raw is not None \
+        else np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    if raw is None:
+        cv2.putText(canvas, "Waiting for camera...", (10, canvas_h//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80,80,120), 1, cv2.LINE_AA)
+    with _chain_lock: chains = _latest_chains
+    if chains:
+        canvas = overlay_chains(canvas, chains, chains.get("bev_w", BEV_W), chains.get("bev_h", BEV_H))
     return canvas
 
+def push_cam(canvas_w, canvas_h):
+    ok, jpg = cv2.imencode(".jpg", build_cam_frame(canvas_w, canvas_h), _enc)
+    if ok: _slot_cam.push(jpg.tobytes())
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  MJPEG SERVER
-# ─────────────────────────────────────────────────────────────────────────────
+# ── HTML ──────────────────────────────────────────────────────────────────────
 
-_ROUTES = {
-    "/":        "rendered",
-    "/rendered":"rendered",
-    "/raw":     "raw",
-    "/both":    "both",
+def _make_dashboard():
+    return """<!doctype html>
+<html><head><meta charset="utf-8"><title>NXP Cup Vision</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#080808;color:#ccc;font:12px monospace;height:100vh;
+     display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:4px;padding:4px}
+.panel{background:#111;border:1px solid #222;border-radius:4px;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+.panel h3{font-size:.75em;color:#6af;padding:4px 8px;border-bottom:1px solid #222;flex-shrink:0}
+.panel img{width:100%;flex:1;object-fit:contain;min-height:0}
+.panel canvas{flex:1;min-height:0;width:100%}
+</style>
+</head><body>
+<div class="panel"><h3>BEV Camera + Lane Chains</h3><img src="/stream"></div>
+<div class="panel"><h3 id="h-imu">IMU Acceleration (m/s\u00b2)</h3><canvas id="c-accel"></canvas></div>
+<div class="panel"><h3>Odometry vx (m/s) &amp; wz (r/s)</h3><canvas id="c-odom"></canvas></div>
+<div class="panel"><h3>Encoder Ticks</h3><canvas id="c-enc"></canvas></div>
+<script>
+const N = 60;
+function mkChart(id, defs) {
+    return new Chart(document.getElementById(id), {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: defs.map(d => ({
+                label: d.label,
+                data: [],
+                borderColor: d.color,
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.2,
+                spanGaps: true
+            }))
+        },
+        options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: { legend: { labels: { color:'#aaa', boxWidth:10, font:{size:10} } } },
+            scales: {
+                x: { display: false },
+                y: { beginAtZero: false, ticks:{ color:'#888', font:{size:10} }, grid:{ color:'#1a1a1a' } }
+            }
+        }
+    });
 }
+const charts = {
+    accel: mkChart('c-accel', [{label:'ax',color:'#f66'},{label:'ay',color:'#6f6'},{label:'az',color:'#66f'}]),
+    odom:  mkChart('c-odom',  [{label:'vx',color:'#fa0'},{label:'wz',color:'#0af'}]),
+    enc:   mkChart('c-enc',   [{label:'Left',color:'#f8a'},{label:'Right',color:'#8fa'}])
+};
+function addPoint(chart, ...vals) {
+    chart.data.labels.push(Date.now());
+    if (chart.data.labels.length > N) chart.data.labels.shift();
+    chart.data.datasets.forEach((ds, i) => {
+        ds.data.push(vals[i] != null ? vals[i] : null);
+        if (ds.data.length > N) ds.data.shift();
+    });
+    chart.update('none');
+}
+let t = 0;
+setTimeout(() => {
+setInterval(async () => {
+    try {
+        const resp = await fetch('/data?t=' + (t++));
+        const d    = await resp.json();
+        if (d.imu)   addPoint(charts.accel, d.imu.ax, d.imu.ay, d.imu.az);
+        if (d.odom)  addPoint(charts.odom,  d.odom.vx, d.odom.wz);
+        if (d.ticks) addPoint(charts.enc,   d.ticks.left, d.ticks.right);
+        if (d.imu)   document.getElementById('h-imu').textContent =
+            'IMU  ax:' + d.imu.ax.toFixed(2) + '  ay:' + d.imu.ay.toFixed(2) + '  az:' + d.imu.az.toFixed(2);
+    } catch(e) { console.error(e); }
+}, 150);
+}, 1000);
+</script>
+</body></html>"""
 
-def _make_page(port):
-    return (
-        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n"
-        "<!doctype html><html><head><title>NXP Chain Viewer</title>"
-        "<style>body{margin:0;background:#0a0a0f;"
-        "font-family:monospace;color:#8cf;display:flex;"
-        "flex-direction:column;align-items:center;}"
-        "h2{margin:8px;font-size:1em;}"
-        "img{max-width:100%;}"
-        "nav a{color:#8cf;margin:0 12px;text-decoration:none;font-size:.85em;}"
-        "</style></head><body>"
-        "<h2>NXP Cup – Lane Chain Viewer</h2>"
-        "<nav>"
-        f"<a href='http://localhost:{port}/'>Rendered</a>"
-        f"<a href='http://localhost:{port}/raw'>Raw BEV</a>"
-        f"<a href='http://localhost:{port}/both'>Side-by-side</a>"
-        "</nav><br>"
-        "<img src='/stream'/>"
-        "</body></html>"
-    ).encode()
-
+# ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class _Handler(BaseHTTPRequestHandler):
-    _port = DEFAULT_PORT
+    _canvas_w = BEV_W * DEFAULT_SCALE
+    _canvas_h = BEV_H * DEFAULT_SCALE
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, *a): pass
 
     def do_GET(self):
-        route = _ROUTES.get(self.path)
+        if self.path.startswith('/data'):
+            with _sensor_lock:
+                imu   = dict(_imu_data)   if _imu_data   else None
+                odom  = dict(_odom_data)  if _odom_data  else None
+                ticks = dict(_ticks_data) if _ticks_data else None
+            body = json.dumps({'imu': imu, 'odom': odom, 'ticks': ticks}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type',   'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control',  'no-store')
+            self.end_headers()
+            self.wfile.write(body)
 
-        if route is None and self.path != "/stream":
+        elif self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            seq = -1
+            try:
+                while True:
+                    seq, jpg = _slot_cam.get_if_newer(seq)
+                    if jpg:
+                        hdr = (b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                               + str(len(jpg)).encode() + b'\r\n\r\n')
+                        self.wfile.write(hdr + jpg + b'\r\n')
+                        self.wfile.flush()
+                    else:
+                        time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        elif self.path in ('/', '/index.html'):
+            body = _make_dashboard().encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type',   'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control',  'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+
+        else:
             self.send_error(404)
-            return
 
-        # HTML page for non-stream requests
-        if self.path in _ROUTES and self.path != "/stream":
-            self.wfile.write(_make_page(self._port))
-            return
-
-        # Pick which slot to stream based on Referer or path
-        # Default slot is rendered; /raw and /both override
-        slot = _slot_rendered
-        if "raw"  in self.headers.get("Referer", "") or self.path.endswith("raw"):
-            slot = _slot_raw
-        elif "both" in self.headers.get("Referer", "") or self.path.endswith("both"):
-            slot = _slot_both
-
-        self.send_response(200)
-        self.send_header("Content-Type",
-                         "multipart/x-mixed-replace; boundary=frame")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-
-        seq = -1
-        try:
-            while True:
-                seq, jpg = slot.get_if_newer(seq)
-                if jpg:
-                    hdr = (
-                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                        + str(len(jpg)).encode() + b"\r\n\r\n"
-                    )
-                    self.wfile.write(hdr + jpg + b"\r\n")
-                    self.wfile.flush()
-                else:
-                    time.sleep(0.01)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-
-def start_server(port):
-    _Handler._port = port
-    srv = HTTPServer(("0.0.0.0", port), _Handler)
+def start_server(port, canvas_w, canvas_h):
+    _Handler._canvas_w = canvas_w
+    _Handler._canvas_h = canvas_h
+    srv = ThreadingHTTPServer(('0.0.0.0', port), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
+# ── ROS 2 node ────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROS 2 NODE
-# ─────────────────────────────────────────────────────────────────────────────
+class VisionStreamNode(Node):
+    def __init__(self, canvas_w, canvas_h):
+        super().__init__('nxp_vision_stream')
+        self._cw     = canvas_w
+        self._ch     = canvas_h
+        self._bridge = CvBridge()
+        be = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                        durability=DurabilityPolicy.VOLATILE, depth=5)
+        self.create_subscription(Image,            '/nxp_cup/debug_image', self._on_image,  10)
+        self.create_subscription(String,           '/nxp_cup/lane_chains', self._on_chains, 10)
+        self.create_subscription(Imu,              '/nxp_cup/imu',         self._on_imu,    be)
+        self.create_subscription(Odometry,         '/nxp_cup/wheel_odom',  self._on_odom,   be)
+        self.create_subscription(Int32MultiArray,  '/nxp_cup/wheel_ticks', self._on_ticks,  be)
+        self.get_logger().info('VisionStreamNode ready')
 
-class ChainViewerNode(Node):
-    def __init__(self, canvas_w, canvas_h, subscribe_raw):
-        super().__init__("nxp_chain_viewer")
-        self._cw = canvas_w
-        self._ch = canvas_h
-        self._bridge = CvBridge() if subscribe_raw else None
-        self._raw_ok = False
+    def _on_image(self, msg):
+        global _latest_frame
+        try: bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception: return
+        with _frame_lock: _latest_frame = bgr
+        push_cam(self._cw, self._ch)
 
-        self.create_subscription(
-            String, "/nxp_cup/lane_chains",
-            self._on_chains, 10
-        )
+    def _on_chains(self, msg):
+        global _latest_chains
+        try: data = json.loads(msg.data)
+        except Exception: return
+        with _chain_lock: _latest_chains = data
+        push_cam(self._cw, self._ch)
 
-        if subscribe_raw:
-            self.create_subscription(
-                Image, "/nxp_cup/debug_image",
-                self._on_raw_image, 10
-            )
+    def _on_imu(self, msg):
+        global _imu_data
+        with _sensor_lock:
+            _imu_data = {'ax': msg.linear_acceleration.x, 'ay': msg.linear_acceleration.y,
+                         'az': msg.linear_acceleration.z, 'gx': msg.angular_velocity.x,
+                         'gy': msg.angular_velocity.y,    'gz': msg.angular_velocity.z,
+                         'stamp': time.time()}
 
-        self.get_logger().info(
-            f"Subscribed to /nxp_cup/lane_chains"
-            + (" + /nxp_cup/debug_image" if subscribe_raw else "")
-        )
+    def _on_odom(self, msg):
+        global _odom_data
+        q = msg.pose.pose.orientation
+        with _sensor_lock:
+            _odom_data = {'vx': msg.twist.twist.linear.x,  'wz': msg.twist.twist.angular.z,
+                          'x':  msg.pose.pose.position.x,  'y':  msg.pose.pose.position.y,
+                          'yaw': math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y**2+q.z**2)),
+                          'stamp': time.time()}
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
+    def _on_ticks(self, msg):
+        global _ticks_data
+        with _sensor_lock:
+            _ticks_data = {'left':  msg.data[0] if len(msg.data) > 0 else 0,
+                           'right': msg.data[1] if len(msg.data) > 1 else 0,
+                           'stamp': time.time()}
 
-    def _on_chains(self, msg: String):
-        global _last_chain_t
-        _last_chain_t = time.time()
-
-        try:
-            data = json.loads(msg.data)
-        except json.JSONDecodeError as e:
-            self.get_logger().warn(f"JSON parse error: {e}")
-            return
-
-        # Rendered visualisation
-        rendered = render_chains(data, self._cw, self._ch)
-        self._push_rendered(rendered, data)
-
-    def _on_raw_image(self, msg: Image):
-        try:
-            bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            self.get_logger().warn(f"cv_bridge error: {e}")
-            return
-
-        self._raw_ok = True
-        ok, jpg = cv2.imencode(".jpg", bgr, _enc)
-        if ok:
-            _slot_raw.push(jpg.tobytes())
-
-        # Update both slot if we have a rendered frame too
-        self._update_both(bgr)
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _push_rendered(self, rendered, data):
-        ok, jpg = cv2.imencode(".jpg", rendered, _enc)
-        if ok:
-            _slot_rendered.push(jpg.tobytes())
-        # Try to update "both" slot
-        self._update_both(None)
-
-    def _update_both(self, raw_bgr_override):
-        """Compose rendered + raw side by side and push to _slot_both."""
-        # Get latest rendered as numpy (re-render is cheap; we just re-read
-        # from the rendered slot by decoding the last JPEG)
-        with _slot_rendered._lock:
-            r_jpg = _slot_rendered._jpg
-        with _slot_raw._lock:
-            raw_jpg = _slot_raw._jpg
-
-        if not r_jpg:
-            return
-
-        rendered = cv2.imdecode(np.frombuffer(r_jpg, np.uint8), cv2.IMREAD_COLOR)
-        if rendered is None:
-            return
-
-        if raw_jpg:
-            raw = cv2.imdecode(np.frombuffer(raw_jpg, np.uint8), cv2.IMREAD_COLOR)
-            if raw is not None:
-                # Scale raw to same height as rendered
-                rh = rendered.shape[0]
-                raw_rw = int(raw.shape[1] * rh / raw.shape[0])
-                raw = cv2.resize(raw, (raw_rw, rh))
-                both = np.hstack([rendered, raw])
-            else:
-                both = rendered
-        else:
-            both = rendered
-
-        ok, jpg = cv2.imencode(".jpg", both, _enc)
-        if ok:
-            _slot_both.push(jpg.tobytes())
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  STALE-SIGNAL WATCHDOG
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _watchdog(canvas_w, canvas_h):
-    """Push a 'no signal' frame if no chain message arrives for STALE_TIMEOUT."""
+def _watchdog(cw, ch):
     while True:
         time.sleep(0.5)
-        if time.time() - _last_chain_t > STALE_TIMEOUT:
-            frame = no_signal_frame(canvas_w, canvas_h)
-            ok, jpg = cv2.imencode(".jpg", frame, _enc)
-            if ok:
-                jpg_bytes = jpg.tobytes()
-                _slot_rendered.push(jpg_bytes)
-                _slot_both.push(jpg_bytes)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+        push_cam(cw, ch)
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="NXP Cup lane-chain viewer – MJPEG stream over SSH"
-    )
-    p.add_argument("--port",   type=int, default=DEFAULT_PORT,
-                   help=f"HTTP port (default {DEFAULT_PORT})")
-    p.add_argument("--scale",  type=int, default=DEFAULT_SCALE,
-                   help="Canvas scale factor relative to BEV (default 2)")
-    p.add_argument("--no-raw", action="store_true",
-                   help="Don't subscribe to debug_image topic")
-    return p.parse_args()
-
+    import rclpy.utilities
+    argv = rclpy.utilities.remove_ros_args(sys.argv[1:])
+    p = argparse.ArgumentParser()
+    p.add_argument('--port',  type=int, default=DEFAULT_PORT)
+    p.add_argument('--scale', type=int, default=DEFAULT_SCALE)
+    return p.parse_args(argv)
 
 def main():
-    args    = parse_args()
-    bev_w   = 400
-    bev_h   = 300
-    canvas_w = bev_w * args.scale
-    canvas_h = bev_h * args.scale
-
-    # Start MJPEG server
-    start_server(args.port)
-    print(f"\n[Viewer]  http://<navqplus-ip>:{args.port}")
-    print(f"          Routes:  /  (rendered)  /raw  /both")
-    print(f"          Find IP: ip addr show | grep 'inet '\n")
-
-    # Pre-fill with no-signal frame so the browser shows something immediately
-    ns = no_signal_frame(canvas_w, canvas_h)
-    ok, jpg = cv2.imencode(".jpg", ns, _enc)
-    if ok:
-        b = jpg.tobytes()
-        _slot_rendered.push(b)
-        _slot_both.push(b)
-
-    # Stale-signal watchdog
-    threading.Thread(
-        target=_watchdog, args=(canvas_w, canvas_h), daemon=True
-    ).start()
-
-    # ROS 2
     rclpy.init()
-    node = ChainViewerNode(canvas_w, canvas_h,
-                           subscribe_raw=not args.no_raw)
-
-    print("[Running]  Ctrl-C to stop\n")
+    args     = parse_args()
+    canvas_w = BEV_W * args.scale
+    canvas_h = BEV_H * args.scale
+    start_server(args.port, canvas_w, canvas_h)
+    print(f'\n[Dashboard]  http://<navqplus-ip>:{args.port}\n')
+    threading.Thread(target=_watchdog, args=(canvas_w, canvas_h), daemon=True).start()
+    node = VisionStreamNode(canvas_w, canvas_h)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print("\n[Stopped]")
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

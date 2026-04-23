@@ -89,6 +89,15 @@ def generate_launch_description():
             }],
         ),
 
+        # ── Stream viewer ────────────────────────────────────────────────────────
+        Node(
+            package="nxp_cup_hw",
+            executable="vision_stream",
+            name="vision_stream",
+            output="screen",
+
+        ),
+
         # ── Bicycle model ─────────────────────────────────────────────────────
         Node(
             package="nxp_cup_hw",
