@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import Optional
 
@@ -52,3 +51,143 @@ class KinematicBicycleDerivative:
     y_dot: float = 0.0
     psi_dot: float = 0.0
     v_dot: float = 0.0
+
+
+@dataclass
+class DynamicBicycleState:
+    x: float = 0.0
+    y: float = 0.0
+    psi: float = 0.0
+
+    v_x: float = 0.0
+    v_y: float = 0.0
+    r: float = 0.0
+
+
+@dataclass
+class DynamicBicycleInput:
+    delta_f_rad: float = 0.0
+
+    longitudinal_force_n: float = 0.0
+    front_lateral_force_n: float = 0.0
+    rear_lateral_force_n: float = 0.0
+
+    drag_force_n: float = 0.0
+    ramp_force_n: float = 0.0
+    torque_vectoring_yaw_moment_n_m: float = 0.0
+
+
+@dataclass
+class DynamicBicycleDerivative:
+    a_x_body: float = 0.0
+
+    v_x_dot: float = 0.0
+    v_y_dot: float = 0.0
+    r_dot: float = 0.0
+
+    x_dot: float = 0.0
+    y_dot: float = 0.0
+    psi_dot: float = 0.0
+
+
+@dataclass
+class SlipAngles:
+    alpha_f: float = 0.0
+    alpha_r: float = 0.0
+    valid: bool = False
+
+
+@dataclass
+class LinearTireForces:
+    front_lateral_force_n: float = 0.0
+    rear_lateral_force_n: float = 0.0
+
+    front_cornering_stiffness_n_per_rad: float = 0.0
+    rear_cornering_stiffness_n_per_rad: float = 0.0
+
+    valid: bool = False
+
+
+@dataclass
+class SteeringActuatorState:
+    delta_ref_rad: float = 0.0
+    delta_f_est_rad: float = 0.0
+    delta_error_rad: float = 0.0
+    tau_s: float = 0.0
+
+
+@dataclass
+class PropulsionActuatorState:
+    pwm_cmd: float = 0.0
+    battery_voltage_v: float = 0.0
+    voltage_sag_v: float = 0.0
+
+    target_force_n: float = 0.0
+    force_longitudinal_est_n: float = 0.0
+
+    tau_s: float = 0.0
+    force_gain_n_per_v: float = 0.0
+
+@dataclass
+class WheelForceDecomposition:
+    """
+    Left/right rear wheel force decomposition.
+
+    f_long_n:
+        common-mode longitudinal force
+
+    dfx_n:
+        differential longitudinal force:
+        dFx = F_x,R - F_x,L
+
+    fx_left_n, fx_right_n:
+        reconstructed left and right rear longitudinal forces
+
+    torque_vectoring_yaw_moment_n_m:
+        M_z_TV = (track_width / 2) * dFx
+    """
+    f_long_n: float = 0.0
+    dfx_n: float = 0.0
+
+    fx_left_n: float = 0.0
+    fx_right_n: float = 0.0
+
+    reconstructed_f_long_n: float = 0.0
+    reconstructed_dfx_n: float = 0.0
+
+    rear_track_width_m: float = 0.0
+    torque_vectoring_yaw_moment_n_m: float = 0.0
+
+    valid: bool = False
+
+@dataclass
+class StateSpacePlant:
+    """
+    Unified control-oriented state-space representation.
+
+    x_state:
+        [v_x, v_y, r]
+
+    u_input:
+        [F_x,L, F_x,R, delta_f]
+
+    A_x, B_x:
+        scheduled matrices from the report
+
+    d_vector:
+        optional disturbance / unmodeled dynamics vector
+
+    x_dot_pred:
+        A(x)x + B(x)u + d
+    """
+    x_state: list = None
+    u_input: list = None
+
+    A_x: list = None
+    B_x: list = None
+    d_vector: list = None
+    x_dot_pred: list = None
+
+    vx_safe: float = 0.0
+    valid: bool = False
+
