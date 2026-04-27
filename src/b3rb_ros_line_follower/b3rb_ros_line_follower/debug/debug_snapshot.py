@@ -1,6 +1,6 @@
 import math
 
-from ..mrac_config import DEBUG_FIELDS
+from ..mrac_config import DEBUG_FIELDS, DYNAMIC_BICYCLE_MASS_KG
 
 
 def _rad_to_deg_text(value_rad):
@@ -23,10 +23,28 @@ def build_debug_snapshot(
     propulsion_actuator,
     wheel_forces,
     state_space,
+    inner_lateral_yaw,
+    outer_longitudinal,
+    outer_reference,
+    inner_reference_command,
+    inner_lateral_yaw_reference,
     speed_cmd,
     turn_cmd,
     delta_f_cmd_est,
 ):
+    vx_recon_prev_value = getattr(vehicle, "vx_recon_prev", None)
+    dt_odom_value = getattr(vehicle, "dt_odom", None)
+
+    if vx_recon_prev_value is None:
+        vx_recon_prev_text = "None"
+    else:
+        vx_recon_prev_text = f"{vx_recon_prev_value:.3f}"
+
+    if dt_odom_value is None:
+        dt_odom_text = "None"
+    else:
+        dt_odom_text = f"{dt_odom_value:.4f}"
+
     if camera_measurement.have_measurement:
         ye_text = f"{camera_measurement.ye_cam_filt:.3f}"
         psi_text = f"{camera_measurement.psi_rel_cam_filt:.3f}"
@@ -162,6 +180,18 @@ def build_debug_snapshot(
         motor_tau_text = "None"
 
 
+    if propulsion_actuator is not None:
+        outer_vx_dot_target_text = (
+            f"{propulsion_actuator.target_force_n / DYNAMIC_BICYCLE_MASS_KG:.3f}"
+        )
+        outer_vx_dot_est_text = (
+            f"{propulsion_actuator.force_longitudinal_est_n / DYNAMIC_BICYCLE_MASS_KG:.3f}"
+        )
+    else:
+        outer_vx_dot_target_text = "None"
+        outer_vx_dot_est_text = "None"
+
+
     if wheel_forces is not None:
         dfx_text = f"{wheel_forces.dfx_n:.3f}"
         fx_left_text = f"{wheel_forces.fx_left_n:.3f}"
@@ -231,6 +261,143 @@ def build_debug_snapshot(
 
         ss_valid_text = "False"
 
+
+    if inner_lateral_yaw is not None:
+        inner_valid_text = str(inner_lateral_yaw.valid)
+        inner_vx0_text = f"{inner_lateral_yaw.vx0_ms:.3f}"
+        inner_vx0_safe_text = f"{inner_lateral_yaw.vx0_safe_ms:.3f}"
+
+        inner_x_lat_vy_text = f"{inner_lateral_yaw.x_lat[0]:.3f}"
+        inner_x_lat_r_text = f"{inner_lateral_yaw.x_lat[1]:.3f}"
+
+        inner_A_00_text = f"{inner_lateral_yaw.A_theta[0][0]:.3f}"
+        inner_A_01_text = f"{inner_lateral_yaw.A_theta[0][1]:.3f}"
+        inner_A_10_text = f"{inner_lateral_yaw.A_theta[1][0]:.3f}"
+        inner_A_11_text = f"{inner_lateral_yaw.A_theta[1][1]:.3f}"
+
+        inner_B_delta_0_text = f"{inner_lateral_yaw.B_delta_theta[0]:.3f}"
+        inner_B_delta_1_text = f"{inner_lateral_yaw.B_delta_theta[1]:.3f}"
+
+        inner_B_TV_0_text = f"{inner_lateral_yaw.B_TV[0]:.3f}"
+        inner_B_TV_1_text = f"{inner_lateral_yaw.B_TV[1]:.3f}"
+
+        inner_xdot_vy_text = f"{inner_lateral_yaw.x_dot_pred[0]:.3f}"
+        inner_xdot_r_text = f"{inner_lateral_yaw.x_dot_pred[1]:.3f}"
+    else:
+        inner_valid_text = "False"
+        inner_vx0_text = "None"
+        inner_vx0_safe_text = "None"
+
+        inner_x_lat_vy_text = "None"
+        inner_x_lat_r_text = "None"
+
+        inner_A_00_text = "None"
+        inner_A_01_text = "None"
+        inner_A_10_text = "None"
+        inner_A_11_text = "None"
+
+        inner_B_delta_0_text = "None"
+        inner_B_delta_1_text = "None"
+
+        inner_B_TV_0_text = "None"
+        inner_B_TV_1_text = "None"
+
+        inner_xdot_vy_text = "None"
+        inner_xdot_r_text = "None"
+
+
+    if outer_longitudinal is not None and outer_longitudinal.valid:
+        outer_valid_text = "True"
+        outer_vx_text = f"{outer_longitudinal.vx_ms:.3f}"
+        outer_pwm_text = f"{outer_longitudinal.pwm_cmd:.3f}"
+        outer_battery_voltage_text = f"{outer_longitudinal.battery_voltage_v:.3f}"
+        outer_v_sag_text = f"{outer_longitudinal.voltage_sag_v:.3f}"
+        outer_effective_voltage_text = f"{outer_longitudinal.effective_voltage_v:.3f}"
+        outer_b_batt_est_text = f"{outer_longitudinal.b_batt_est:.3f}"
+        outer_vx_dot_propulsion_text = (
+            f"{outer_longitudinal.vx_dot_propulsion_ms2:.3f}"
+        )
+        outer_vx_loss_text = f"{outer_longitudinal.vx_loss_ms2:.3f}"
+        outer_vx_dot_pred_text = f"{outer_longitudinal.vx_dot_pred_ms2:.3f}"
+        outer_d_x_est_text = f"{outer_longitudinal.d_x_est_ms2:.3f}"
+    else:
+        outer_valid_text = "False"
+        outer_vx_text = "None"
+        outer_pwm_text = "None"
+        outer_battery_voltage_text = "None"
+        outer_v_sag_text = "None"
+        outer_effective_voltage_text = "None"
+        outer_b_batt_est_text = "None"
+        outer_vx_dot_propulsion_text = "None"
+        outer_vx_loss_text = "None"
+        outer_vx_dot_pred_text = "None"
+        outer_d_x_est_text = "None"
+
+    if inner_reference_command is not None:
+        inner_ref_valid_text = str(inner_reference_command.valid)
+        inner_kappa_ref_text = (
+            f"{inner_reference_command.kappa_ref_1pm:.3f}"
+        )
+        inner_r_ref_text = (
+            f"{inner_reference_command.r_ref_rad_s:.3f}"
+        )
+        inner_uc_text = (
+            f"{inner_reference_command.uc_rad_s:.3f}"
+        )
+    else:
+        inner_ref_valid_text = "False"
+        inner_kappa_ref_text = "None"
+        inner_r_ref_text = "None"
+        inner_uc_text = "None"
+
+
+    if outer_reference is not None and outer_reference.valid:
+        outer_ref_valid_text = "True"
+        outer_vx_ref_text = f"{outer_reference.vx_ref_ms:.3f}"
+        outer_vx_m_text = f"{outer_reference.vx_m_ms:.3f}"
+        outer_vx_m_dot_text = f"{outer_reference.vx_m_dot_ms2:.3f}"
+        outer_ref_error_text = f"{outer_reference.tracking_error_ms:.3f}"
+        outer_ref_a_m_text = f"{outer_reference.a_m_s_inv:.3f}"
+        outer_ref_dt_text = f"{outer_reference.dt_s:.3f}"
+    else:
+        outer_ref_valid_text = "False"
+        outer_vx_ref_text = "None"
+        outer_vx_m_text = "None"
+        outer_vx_m_dot_text = "None"
+        outer_ref_error_text = "None"
+        outer_ref_a_m_text = "None"
+        outer_ref_dt_text = "None"
+
+
+    if inner_lateral_yaw_reference is not None:
+        inner_model_valid_text = str(inner_lateral_yaw_reference.valid)
+        inner_xm_vy_text = f"{inner_lateral_yaw_reference.vy_m_ms:.3f}"
+        inner_xm_r_text = f"{inner_lateral_yaw_reference.r_m_rad_s:.3f}"
+        inner_xm_dot_vy_text = f"{inner_lateral_yaw_reference.vy_m_dot_ms2:.3f}"
+        inner_xm_dot_r_text = f"{inner_lateral_yaw_reference.r_m_dot_rad_s2:.3f}"
+
+        inner_Am_00_text = f"{inner_lateral_yaw_reference.A_m[0][0]:.3f}"
+        inner_Am_01_text = f"{inner_lateral_yaw_reference.A_m[0][1]:.3f}"
+        inner_Am_10_text = f"{inner_lateral_yaw_reference.A_m[1][0]:.3f}"
+        inner_Am_11_text = f"{inner_lateral_yaw_reference.A_m[1][1]:.3f}"
+
+        inner_Bm_0_text = f"{inner_lateral_yaw_reference.B_m[0][0]:.3f}"
+        inner_Bm_1_text = f"{inner_lateral_yaw_reference.B_m[1][0]:.3f}"
+    else:
+        inner_model_valid_text = "False"
+        inner_xm_vy_text = "None"
+        inner_xm_r_text = "None"
+        inner_xm_dot_vy_text = "None"
+        inner_xm_dot_r_text = "None"
+
+        inner_Am_00_text = "None"
+        inner_Am_01_text = "None"
+        inner_Am_10_text = "None"
+        inner_Am_11_text = "None"
+
+        inner_Bm_0_text = "None"
+        inner_Bm_1_text = "None"
+
     debug_map = {
         "turn_cmd": f"turn_cmd={turn_cmd:.3f}",
         "speed_cmd": f"speed_cmd={speed_cmd:.3f}",
@@ -239,6 +406,8 @@ def build_debug_snapshot(
         "y_meas": f"y_meas={vehicle.y_meas:.3f}",
         "yaw_meas": f"yaw_meas={vehicle.yaw_meas:.3f}",
         "vx_recon": f"vx_recon={vehicle.vx_recon:.3f}",
+        "vx_recon_prev": f"vx_recon_prev={vx_recon_prev_text}",
+        "dt_odom": f"dt_odom={dt_odom_text}",
         "vy_recon": f"vy_recon={vehicle.vy_recon:.3f}",
         "r_recon": f"r_recon={vehicle.r_recon:.3f}",
         "a_long_recon": f"a_long_recon={vehicle.a_long_recon:.3f}",
@@ -261,6 +430,8 @@ def build_debug_snapshot(
         "v_sag": f"v_sag={v_sag_text}",
         "f_long_target": f"f_long_target={f_long_target_text}",
         "f_long_est": f"f_long_est={f_long_est_text}",
+        "outer_vx_dot_target": f"outer_vx_dot_target={outer_vx_dot_target_text}",
+        "outer_vx_dot_est": f"outer_vx_dot_est={outer_vx_dot_est_text}",
         "motor_tau_s": f"motor_tau_s={motor_tau_text}",
 
         "dfx_cmd": f"dfx_cmd={dfx_text}",
@@ -293,6 +464,62 @@ def build_debug_snapshot(
         "ss_B_20": f"ss_B_20={ss_B_20_text}",
         "ss_B_21": f"ss_B_21={ss_B_21_text}",
         "ss_B_22": f"ss_B_22={ss_B_22_text}",
+
+        "inner_valid": f"inner_valid={inner_valid_text}",
+        "inner_vx0": f"inner_vx0={inner_vx0_text}",
+        "inner_vx0_safe": f"inner_vx0_safe={inner_vx0_safe_text}",
+        "inner_x_lat_vy": f"inner_x_lat_vy={inner_x_lat_vy_text}",
+        "inner_x_lat_r": f"inner_x_lat_r={inner_x_lat_r_text}",
+        "inner_A_00": f"inner_A_00={inner_A_00_text}",
+        "inner_A_01": f"inner_A_01={inner_A_01_text}",
+        "inner_A_10": f"inner_A_10={inner_A_10_text}",
+        "inner_A_11": f"inner_A_11={inner_A_11_text}",
+        "inner_B_delta_0": f"inner_B_delta_0={inner_B_delta_0_text}",
+        "inner_B_delta_1": f"inner_B_delta_1={inner_B_delta_1_text}",
+        "inner_B_TV_0": f"inner_B_TV_0={inner_B_TV_0_text}",
+        "inner_B_TV_1": f"inner_B_TV_1={inner_B_TV_1_text}",
+        "inner_xdot_vy": f"inner_xdot_vy={inner_xdot_vy_text}",
+        "inner_xdot_r": f"inner_xdot_r={inner_xdot_r_text}",
+
+        "inner_ref_valid": f"inner_ref_valid={inner_ref_valid_text}",
+        "inner_kappa_ref": f"inner_kappa_ref={inner_kappa_ref_text}",
+        "inner_r_ref": f"inner_r_ref={inner_r_ref_text}",
+        "inner_uc": f"inner_uc={inner_uc_text}",
+
+        "outer_valid": f"outer_valid={outer_valid_text}",
+        "outer_vx": f"outer_vx={outer_vx_text}",
+        "outer_pwm": f"outer_pwm={outer_pwm_text}",
+        "outer_battery_voltage": f"outer_battery_voltage={outer_battery_voltage_text}",
+        "outer_v_sag": f"outer_v_sag={outer_v_sag_text}",
+        "outer_effective_voltage": f"outer_effective_voltage={outer_effective_voltage_text}",
+        "outer_b_batt_est": f"outer_b_batt_est={outer_b_batt_est_text}",
+        "outer_vx_dot_propulsion": (
+            f"outer_vx_dot_propulsion={outer_vx_dot_propulsion_text}"
+        ),
+        "outer_vx_loss": f"outer_vx_loss={outer_vx_loss_text}",
+        "outer_vx_dot_pred": f"outer_vx_dot_pred={outer_vx_dot_pred_text}",
+        "outer_d_x_est": f"outer_d_x_est={outer_d_x_est_text}",
+
+        "outer_ref_valid": f"outer_ref_valid={outer_ref_valid_text}",
+        "outer_vx_ref": f"outer_vx_ref={outer_vx_ref_text}",
+        "outer_vx_m": f"outer_vx_m={outer_vx_m_text}",
+        "outer_vx_m_dot": f"outer_vx_m_dot={outer_vx_m_dot_text}",
+        "outer_ref_error": f"outer_ref_error={outer_ref_error_text}",
+        "outer_ref_a_m": f"outer_ref_a_m={outer_ref_a_m_text}",
+        "outer_ref_dt": f"outer_ref_dt={outer_ref_dt_text}",
+
+        "inner_model_valid": f"inner_model_valid={inner_model_valid_text}",
+        "inner_xm_vy": f"inner_xm_vy={inner_xm_vy_text}",
+        "inner_xm_r": f"inner_xm_r={inner_xm_r_text}",
+        "inner_xm_dot_vy": f"inner_xm_dot_vy={inner_xm_dot_vy_text}",
+        "inner_xm_dot_r": f"inner_xm_dot_r={inner_xm_dot_r_text}",
+
+        "inner_Am_00": f"inner_Am_00={inner_Am_00_text}",
+        "inner_Am_01": f"inner_Am_01={inner_Am_01_text}",
+        "inner_Am_10": f"inner_Am_10={inner_Am_10_text}",
+        "inner_Am_11": f"inner_Am_11={inner_Am_11_text}",
+        "inner_Bm_0": f"inner_Bm_0={inner_Bm_0_text}",
+        "inner_Bm_1": f"inner_Bm_1={inner_Bm_1_text}",
 
         "beta_kin": f"beta_kin={beta_text}",
         "x_dot_kin": f"x_dot_kin={xdot_text}",

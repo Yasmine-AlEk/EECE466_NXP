@@ -5,6 +5,7 @@
 # Licensed under the Apache License, Version 2.0
 
 import rclpy
+from . import mrac_config as cfg
 from rclpy.node import Node
 from sensor_msgs.msg import Joy, LaserScan
 from nav_msgs.msg import Odometry
@@ -16,6 +17,8 @@ from .estimation.vehicle_state_estimator import VehicleStateEstimator
 from .models.actuator_models import PropulsionForceModel, SteeringActuatorModel
 from .models.dynamic_bicycle import DynamicBicycleModel
 from .models.kinematic_bicycle import KinematicBicycleModel
+from .models.outer_longitudinal_reduced import OuterLongitudinalReducedModel
+from .models.outer_longitudinal_reference import OuterLongitudinalReferenceModel
 from .models.state_space_vehicle import StateSpaceVehicleModel
 from .models.wheel_force_decomposition import WheelForceDecompositionModel
 from .mrac_config import (
@@ -60,6 +63,12 @@ from .mrac_types import (
 from .mrac_utils import turn_cmd_to_delta_f_est
 from .perception.camera_measurements import CameraMeasurementExtractor
 
+
+from .models.inner_lateral_yaw_reduced import InnerLateralYawReducedModel
+from .models.inner_reference_command import InnerReferenceCommandModel
+from .models.inner_lateral_yaw_reference import InnerLateralYawReferenceModel
+from .models.speed_scheduler import FilteredSpeedScheduler
+from .models.battery_gain_estimator import BatteryGainEstimator
 
 class LineFollower(Node):
     """Line follower node with baseline control and MRAC/model scaffolding."""
@@ -173,6 +182,80 @@ class LineFollower(Node):
             min_vx_ms=STATE_SPACE_MIN_VX_MS,
         )
 
+        self.outer_longitudinal_model = OuterLongitudinalReducedModel(
+            mass_kg=cfg.DYNAMIC_BICYCLE_MASS_KG,
+            force_gain_n_per_v=cfg.PROPULSION_FORCE_GAIN_N_PER_V,
+            efficiency=cfg.PROPULSION_EFFICIENCY,
+            d_x_limit_ms2=cfg.OUTER_LONGITUDINAL_DX_LIMIT_MS2,
+            k_v_loss_s=cfg.OUTER_LONGITUDINAL_K_V_S,
+        )
+
+        self.outer_reference_model = OuterLongitudinalReferenceModel(
+            a_m_s_inv=cfg.OUTER_REFERENCE_A_M_S_INV,
+            speed_cmd_to_vx_ref_gain=cfg.OUTER_REFERENCE_SPEED_CMD_TO_VX_GAIN,
+            min_vx_ref_ms=cfg.OUTER_REFERENCE_MIN_VX_REF_MS,
+            max_vx_ref_ms=cfg.OUTER_REFERENCE_MAX_VX_REF_MS,
+            max_dt_s=cfg.OUTER_REFERENCE_MAX_DT_S,
+        )
+
+        self.inner_lateral_yaw_model = InnerLateralYawReducedModel(
+            mass_kg=cfg.DYNAMIC_BICYCLE_MASS_KG,
+            iz_kg_m2=cfg.DYNAMIC_BICYCLE_IZ_KG_M2,
+            lf_m=cfg.DYNAMIC_BICYCLE_LF_M,
+            lr_m=cfg.DYNAMIC_BICYCLE_LR_M,
+            rear_track_width_m=cfg.REAR_TRACK_WIDTH_M,
+            c_alpha_f_n_per_rad=cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD,
+            c_alpha_r_n_per_rad=cfg.REAR_CORNERING_STIFFNESS_N_PER_RAD,
+            min_vx_ms=cfg.INNER_LATERAL_YAW_MIN_VX_MS,
+        )
+
+        self.inner_reference_command_model = InnerReferenceCommandModel(
+            kappa_from_ye_gain_1pm=cfg.INNER_REF_KAPPA_FROM_YE_GAIN_1PM,
+            kappa_from_psi_gain_1pm=cfg.INNER_REF_KAPPA_FROM_PSI_GAIN_1PM,
+            kappa_sign=cfg.INNER_REF_KAPPA_SIGN,
+            max_abs_kappa_1pm=cfg.INNER_REF_MAX_ABS_KAPPA_1PM,
+            max_abs_r_ref_rad_s=cfg.INNER_REF_MAX_ABS_R_REF_RAD_S,
+            min_vx_ms=cfg.INNER_REF_MIN_VX_MS,
+        )
+
+
+        self.inner_speed_scheduler = FilteredSpeedScheduler(
+            tau_s=cfg.INNER_SPEED_SCHEDULER_TAU_S,
+            min_valid_vx_ms=cfg.INNER_LATERAL_YAW_MIN_VX_MS,
+            max_dt_s=cfg.INNER_SPEED_SCHEDULER_MAX_DT_S,
+        )
+
+        self.latest_inner_lateral_yaw = None
+        self.latest_inner_reference_command = None
+        self.latest_camera_measurement = None
+        self.latest_inner_speed_schedule = None
+
+        self.inner_lateral_yaw_reference_model = InnerLateralYawReferenceModel(
+            a_vy_s_inv=cfg.INNER_REFERENCE_MODEL_A_VY_S_INV,
+            a_r_s_inv=cfg.INNER_REFERENCE_MODEL_A_R_S_INV,
+            max_abs_uc_rad_s=cfg.INNER_REFERENCE_MODEL_MAX_ABS_UC_RAD_S,
+            max_abs_vy_m_ms=cfg.INNER_REFERENCE_MODEL_MAX_ABS_VY_M_MS,
+            max_abs_r_m_rad_s=cfg.INNER_REFERENCE_MODEL_MAX_ABS_R_M_RAD_S,
+            max_dt_s=cfg.INNER_REFERENCE_MODEL_MAX_DT_S,
+        )
+
+        self.latest_inner_lateral_yaw_reference = None
+
+        self.battery_gain_estimator = BatteryGainEstimator(
+            b_nominal_ms2_per_pwm=cfg.BATTERY_GAIN_EST_NOMINAL_MS2_PER_PWM,
+            tau_s=cfg.BATTERY_GAIN_EST_TAU_S,
+            min_pwm=cfg.BATTERY_GAIN_EST_MIN_PWM,
+            min_vx_ms=cfg.BATTERY_GAIN_EST_MIN_VX_MS,
+            max_abs_r_rad_s=cfg.BATTERY_GAIN_EST_MAX_ABS_R_RAD_S,
+            max_abs_delta_rad=cfg.BATTERY_GAIN_EST_MAX_ABS_DELTA_RAD,
+            min_dt_s=cfg.BATTERY_GAIN_EST_MIN_DT_S,
+            max_dt_s=cfg.BATTERY_GAIN_EST_MAX_DT_S,
+            min_scale=cfg.BATTERY_GAIN_EST_MIN_SCALE,
+            max_scale=cfg.BATTERY_GAIN_EST_MAX_SCALE,
+        )
+
+        self.latest_battery_gain_estimate = None
+
         self.kinematic_state_est = None
         self.latest_kinematic_derivative = None
 
@@ -186,6 +269,8 @@ class LineFollower(Node):
         self.latest_propulsion_actuator = None
         self.latest_wheel_forces = None
         self.latest_state_space = None
+        self.latest_outer_longitudinal = None
+        self.latest_outer_reference = None
 
         self.latest_debug_snapshot = None
 
@@ -256,7 +341,7 @@ class LineFollower(Node):
         battery_voltage_v = self.estimate_battery_voltage()
 
         self.latest_propulsion_actuator = self.propulsion_model.step(
-            pwm_cmd=speed_cmd,
+            pwm_cmd=self.last_speed_cmd,
             battery_voltage_v=battery_voltage_v,
             dt_s=dt_s,
         )
@@ -276,10 +361,31 @@ class LineFollower(Node):
             propulsion_actuator=self.latest_propulsion_actuator,
             wheel_forces=self.latest_wheel_forces,
             state_space=self.latest_state_space,
+            inner_lateral_yaw=self.latest_inner_lateral_yaw,
+            outer_longitudinal=self.latest_outer_longitudinal,
+            outer_reference=self.latest_outer_reference,
+            inner_reference_command=self.latest_inner_reference_command,
+            inner_lateral_yaw_reference=self.latest_inner_lateral_yaw_reference,
             speed_cmd=self.last_speed_cmd,
             turn_cmd=self.controller.last_turn_cmd,
             delta_f_cmd_est=self.delta_f_cmd_est,
         )
+
+    def update_outer_reference_model(self, speed_cmd: float, dt_s: float):
+        """
+        Task 4.1: update the desired longitudinal reference model.
+
+        This does not change the actual command sent to the vehicle.
+        It only creates vx_ref and vx_m for later MRAC tracking.
+        """
+        self.latest_outer_reference = (
+            self.outer_reference_model.step_from_speed_cmd(
+                speed_cmd=speed_cmd,
+                dt_s=dt_s,
+            )
+        )
+
+        self.update_debug_snapshot()
 
     def update_kinematic_bicycle_model(self, dt_s: float):
         """
@@ -376,6 +482,19 @@ class LineFollower(Node):
             + self.latest_wheel_forces.torque_vectoring_yaw_moment_n_m
         )
 
+        self.latest_inner_speed_schedule = self.inner_speed_scheduler.update(
+            raw_vx_ms=vehicle.vx_recon,
+            dt_s=dt_s,
+        )
+
+        self.latest_inner_lateral_yaw = self.inner_lateral_yaw_model.build(
+            vy_ms=vehicle.vy_recon,
+            r_rad_s=vehicle.r_recon,
+            vx0_ms=self.latest_inner_speed_schedule.vx0_ms,
+            delta_f_rad=self.delta_f_cmd_est,
+            dfx_n=self.latest_wheel_forces.dfx_n,
+        )
+
         self.latest_state_space = self.state_space_model.build(
             vx_ms=vehicle.vx_recon,
             vy_ms=vehicle.vy_recon,
@@ -383,6 +502,68 @@ class LineFollower(Node):
             fx_left_n=self.latest_wheel_forces.fx_left_n,
             fx_right_n=self.latest_wheel_forces.fx_right_n,
             delta_f_rad=self.delta_f_cmd_est,
+        )
+
+        if self.latest_propulsion_actuator is not None:
+            self.latest_outer_longitudinal = self.outer_longitudinal_model.build(
+                vx_ms=vehicle.vx_recon,
+                pwm_cmd=self.last_speed_cmd,
+                battery_voltage_v=getattr(
+                    self.latest_propulsion_actuator,
+                    "battery_voltage_v",
+                    cfg.BATTERY_NOMINAL_V,
+                ),
+                voltage_sag_v=getattr(
+                    self.latest_propulsion_actuator,
+                    "voltage_sag_v",
+                    0.0,
+                ),
+                measured_vx_dot_ms2=vehicle.a_long_filt,
+            )
+            self.latest_battery_gain_estimate = (
+                self.battery_gain_estimator.update(
+                    vx_ms=vehicle.vx_recon,
+                    pwm_cmd=self.last_speed_cmd,
+                    measured_vx_dot_ms2=vehicle.a_long_filt,
+                    k_v_loss_s=cfg.OUTER_LONGITUDINAL_K_V_S,
+                    b_voltage_ms2_per_pwm=self.latest_outer_longitudinal.b_batt_est,
+                    r_rad_s=vehicle.r_recon,
+                    delta_f_rad=self.delta_f_cmd_est,
+                    dt_s=dt_s,
+                )
+            )
+
+
+        if (
+            self.latest_camera_measurement is not None
+            and self.latest_inner_lateral_yaw is not None
+        ):
+            self.latest_inner_reference_command = (
+                self.inner_reference_command_model.build(
+                    vx0_ms=self.latest_inner_lateral_yaw.vx0_safe_ms,
+                    have_camera_measurement=(
+                        self.latest_camera_measurement.have_measurement
+                    ),
+                    ye_cam_filt=self.latest_camera_measurement.ye_cam_filt,
+                    psi_rel_cam_filt=(
+                        self.latest_camera_measurement.psi_rel_cam_filt
+                    ),
+                )
+            )
+
+        uc_for_inner_reference_model = 0.0
+        inner_reference_command_valid = False
+
+        if self.latest_inner_reference_command is not None:
+            uc_for_inner_reference_model = self.latest_inner_reference_command.uc_rad_s
+            inner_reference_command_valid = self.latest_inner_reference_command.valid
+
+        self.latest_inner_lateral_yaw_reference = (
+            self.inner_lateral_yaw_reference_model.step(
+                uc_rad_s=uc_for_inner_reference_model,
+                dt_s=dt_s,
+                command_valid=inner_reference_command_valid,
+            )
         )
 
         model_input = DynamicBicycleInput(
@@ -424,6 +605,7 @@ class LineFollower(Node):
         half_width = vectors.image_width / 2.0 if vectors.image_width > 0 else 1.0
 
         camera = self.camera_extractor.extract(vectors, half_width)
+        self.latest_camera_measurement = camera
 
         turn_cmd, speed_cmd, dt_s = self.controller.compute(
             camera=camera,
@@ -433,6 +615,7 @@ class LineFollower(Node):
         )
 
         self.last_speed_cmd = speed_cmd
+        self.update_outer_reference_model(speed_cmd, dt_s)
 
         self.update_actuator_models(speed_cmd, dt_s)
         self.update_kinematic_bicycle_model(dt_s)
@@ -441,7 +624,25 @@ class LineFollower(Node):
         self.rover_move_manual_mode(speed_cmd, turn_cmd)
 
     def odometry_callback(self, message):
+        prev_vx_recon = self.estimator.vehicle.vx_recon
+
+        stamp = message.header.stamp
+        current_odom_time_s = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        previous_odom_time_s = getattr(self, "_debug_previous_odom_time_s", None)
+
         self.estimator.update_from_odometry(message)
+
+        self.estimator.vehicle.vx_recon_prev = prev_vx_recon
+
+        if previous_odom_time_s is None:
+            self.estimator.vehicle.dt_odom = 0.0
+        else:
+            self.estimator.vehicle.dt_odom = max(
+                0.0,
+                current_odom_time_s - previous_odom_time_s,
+            )
+
+        self._debug_previous_odom_time_s = current_odom_time_s
 
     def status_callback(self, message):
         self.estimator.update_from_status(message)
@@ -459,7 +660,49 @@ class LineFollower(Node):
             self.get_logger().info("[MRAC scaffold] no debug fields enabled")
             return
 
-        self.get_logger().info("[MRAC scaffold] " + ", ".join(self.latest_debug_snapshot))
+        snapshot_to_print = list(self.latest_debug_snapshot)
+
+        battery_gain = self.latest_battery_gain_estimate
+        if battery_gain is not None:
+            battery_debug_map = {
+                "batt_gain_valid": (
+                    f"batt_gain_valid={battery_gain.valid}"
+                ),
+                "batt_gain_update": (
+                    f"batt_gain_update={battery_gain.update_enabled}"
+                ),
+                "batt_b_nom": (
+                    f"batt_b_nom={battery_gain.b_nominal_ms2_per_pwm:.3f}"
+                ),
+                "batt_b_voltage": (
+                    f"batt_b_voltage={battery_gain.b_voltage_ms2_per_pwm:.3f}"
+                ),
+                "batt_b_inst": (
+                    f"batt_b_inst={battery_gain.b_inst_ms2_per_pwm:.3f}"
+                ),
+                "batt_b_hat": (
+                    f"batt_b_hat={battery_gain.b_hat_ms2_per_pwm:.3f}"
+                ),
+                "batt_b_error": (
+                    f"batt_b_error={battery_gain.b_error_ms2_per_pwm:.3f}"
+                ),
+                "batt_alpha": (
+                    f"batt_alpha={battery_gain.alpha:.4f}"
+                ),
+                "batt_pred_vx_dot_hat": (
+                    f"batt_pred_vx_dot_hat="
+                    f"{battery_gain.predicted_vx_dot_from_hat_ms2:.3f}"
+                ),
+                "batt_reason": (
+                    f"batt_reason={battery_gain.reason}"
+                ),
+            }
+
+            for field_name in cfg.DEBUG_FIELDS:
+                if field_name in battery_debug_map:
+                    snapshot_to_print.append(battery_debug_map[field_name])
+
+        self.get_logger().info("[MRAC scaffold] " + ", ".join(snapshot_to_print))
 
     def traffic_status_callback(self, message):
         self.traffic_status = message

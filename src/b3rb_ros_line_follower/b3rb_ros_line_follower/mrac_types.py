@@ -191,3 +191,52 @@ class StateSpacePlant:
     vx_safe: float = 0.0
     valid: bool = False
 
+@dataclass
+class OuterLongitudinalReducedOutput:
+    """
+    Outer-loop reduced longitudinal plant.
+
+    Report form:
+
+        v_x_dot = b_batt * PWM + d_x
+
+    vx_ms:
+        reconstructed/measured longitudinal speed
+
+    pwm_cmd:
+        normalized propulsion command
+
+    battery_voltage_v:
+        estimated battery voltage
+
+    voltage_sag_v:
+        estimated voltage sag under load
+
+    effective_voltage_v:
+        battery_voltage_v - voltage_sag_v
+
+    b_batt_est:
+        estimated uncertain battery/propulsion gain
+
+    vx_dot_pred_ms2:
+        predicted longitudinal acceleration from reduced model
+
+    d_x_est_ms2:
+        residual disturbance estimate:
+        measured_vx_dot - vx_dot_pred
+    """
+    vx_ms: float = 0.0
+    pwm_cmd: float = 0.0
+
+    battery_voltage_v: float = 0.0
+    voltage_sag_v: float = 0.0
+    effective_voltage_v: float = 0.0
+
+    b_batt_est: float = 0.0
+    vx_dot_pred_ms2: float = 0.0
+    d_x_est_ms2: float = 0.0
+
+    measured_vx_dot_ms2: float = 0.0
+
+    valid: bool = False
+

@@ -168,42 +168,144 @@ TORQUE_VECTORING_DFX_CMD_N = 0.0
 STATE_SPACE_MIN_VX_MS = 0.20
 STATE_SPACE_K_DRAG_COEFF = 0.0
 
+
+# ============================================================
+# OUTER LONGITUDINAL REDUCED MODEL SETTINGS
+# ------------------------------------------------------------
+# Task 3.1:
+#
+#   v_x_dot = b_batt * PWM + d_x
+#
+# Current scaffold:
+#
+#   b_batt_est = efficiency * force_gain * (V_batt - V_sag) / m
+#
+# This uses the propulsion model from Task 2.6 and packages it
+# in the report's outer-loop reduced form.
+# ============================================================
+# ============================================================
+# INNER LATERAL-YAW REDUCED MODEL
+# ------------------------------------------------------------
+# Task 3.2. Protects the reduced model from division by tiny vx.
+# Task 3.3 will later decide better scheduling/filtering.
+# ============================================================
+INNER_LATERAL_YAW_MIN_VX_MS = 0.20
+
+
+# Task 3.3 scheduling variable handling.
+# vx0 is a filtered version of vx_recon used by the inner lateral-yaw model.
+INNER_SPEED_SCHEDULER_TAU_S = 0.40
+INNER_SPEED_SCHEDULER_MAX_DT_S = 0.20
+
+OUTER_LONGITUDINAL_DX_LIMIT_MS2 = 5.0
+
+# Simple longitudinal resistance term for Task 3.1 refinement.
+# Unit: 1/s because it is used as k_v * vx.
+# First rough calibration from logs:
+# steady vx ≈ 0.55 m/s and propulsion prediction ≈ 0.59 m/s^2
+# so k_v ≈ 0.59 / 0.55 ≈ 1.1.
+OUTER_LONGITUDINAL_K_V_S = 1.0
+
+# ============================================================
+# TASK 4.1: OUTER LONGITUDINAL REFERENCE MODEL
+# ------------------------------------------------------------
+# vx_m_dot = -a_m * vx_m + a_m * vx_ref
+# Larger a_m -> faster reference response.
+# ============================================================
+OUTER_REFERENCE_A_M_S_INV = 2.0
+OUTER_REFERENCE_SPEED_CMD_TO_VX_GAIN = 1.0
+OUTER_REFERENCE_MIN_VX_REF_MS = 0.0
+OUTER_REFERENCE_MAX_VX_REF_MS = 1.0
+OUTER_REFERENCE_MAX_DT_S = 0.20
+
+
+
+
+# ============================================================
+# INNER LATERAL-YAW REFERENCE MODEL
+# ------------------------------------------------------------
+# Task 4.2: x_m_dot = A_m x_m + B_m u_c
+# x_m = [vy_m, r_m]^T
+# ============================================================
+INNER_REFERENCE_MODEL_A_VY_S_INV = 3.0
+INNER_REFERENCE_MODEL_A_R_S_INV = 4.0
+INNER_REFERENCE_MODEL_MAX_ABS_UC_RAD_S = 2.0
+INNER_REFERENCE_MODEL_MAX_ABS_VY_M_MS = 1.0
+INNER_REFERENCE_MODEL_MAX_ABS_R_M_RAD_S = 2.0
+INNER_REFERENCE_MODEL_MAX_DT_S = 0.10
+
+
+# ============================================================
+# TASK 5.1 BATTERY-SIDE GAIN ESTIMATOR SCAFFOLD
+# ------------------------------------------------------------
+# We estimate:
+#   vx_dot = b_batt * PWM - k_v * vx
+#
+# Rearranged:
+#   b_batt_inst = (a_long_filt + k_v * vx) / PWM
+#
+# This estimator is intentionally slow and protected.
+# It is only for validation/debug for now.
+# ============================================================
+BATTERY_GAIN_EST_NOMINAL_MS2_PER_PWM = (
+    PROPULSION_EFFICIENCY
+    * PROPULSION_FORCE_GAIN_N_PER_V
+    * BATTERY_NOMINAL_V
+    / DYNAMIC_BICYCLE_MASS_KG
+)
+
+BATTERY_GAIN_EST_TAU_S = 8.0
+BATTERY_GAIN_EST_MIN_PWM = 0.25
+BATTERY_GAIN_EST_MIN_VX_MS = 0.20
+BATTERY_GAIN_EST_MAX_ABS_R_RAD_S = 0.08
+BATTERY_GAIN_EST_MAX_ABS_DELTA_RAD = 0.0873
+BATTERY_GAIN_EST_MIN_DT_S = 0.0001
+BATTERY_GAIN_EST_MAX_DT_S = 0.20
+BATTERY_GAIN_EST_MIN_SCALE = 0.50
+BATTERY_GAIN_EST_MAX_SCALE = 1.50
+
 # ============================================================
 # DEBUG FIELD SELECTION
 # ------------------------------------------------------------
 # Task 2.5 / 2.6 validation only.
 # ============================================================
+
+
+# ============================================================
+# Task 3.4: inner-loop yaw-rate reference command
+# ------------------------------------------------------------
+# Temporary curvature proxy from camera outputs:
+# kappa_ref = sign * (K_y * ye_cam_filt + K_psi * psi_rel_cam_filt)
+# r_ref = vx0 * kappa_ref
+# ============================================================
+INNER_REF_KAPPA_FROM_YE_GAIN_1PM = 0.8
+INNER_REF_KAPPA_FROM_PSI_GAIN_1PM = 1.6
+INNER_REF_KAPPA_SIGN = 1.0
+
+INNER_REF_MAX_ABS_KAPPA_1PM = 2.0
+INNER_REF_MAX_ABS_R_REF_RAD_S = 1.2
+INNER_REF_MIN_VX_MS = 0.20
+
 DEBUG_FIELDS = [
-    # Task 2.7 + 2.8 validation
+    "speed_cmd",
     "vx_recon",
-    "vy_recon",
+    "a_long_filt",
+    "pwm_cmd",
+    "outer_vx_loss",
+    "outer_vx_dot_propulsion",
+    "outer_vx_dot_pred",
+    "outer_d_x_est",
+    "outer_b_batt_est",
+    "batt_gain_valid",
+    "batt_gain_update",
+    "batt_b_nom",
+    "batt_b_voltage",
+    "batt_b_inst",
+    "batt_b_hat",
+    "batt_b_error",
+    "batt_alpha",
+    "batt_pred_vx_dot_hat",
+    "batt_reason",
     "r_recon",
-
-    "fx_left",
-    "fx_right",
-    "fx_sum_recon",
-    "dfx_recon",
-
     "delta_f_est_deg",
-
-    "ss_valid",
-    "ss_x_dim",
-    "ss_u_dim",
-    "ss_A_dim",
-    "ss_B_dim",
-
-    "ss_vx_safe",
-    "ss_xdot_vx",
-    "ss_xdot_vy",
-    "ss_xdot_r",
-
-    "ss_A_11",
-    "ss_A_12",
-    "ss_A_21",
-    "ss_A_22",
-    "ss_B_00",
-    "ss_B_01",
-    "ss_B_20",
-    "ss_B_21",
-    "ss_B_22",
 ]
