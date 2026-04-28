@@ -28,6 +28,10 @@ def build_debug_snapshot(
     outer_reference,
     inner_reference_command,
     inner_lateral_yaw_reference,
+    cornering_stiffness_outputs,
+    cornering_stiffness_matrix,
+    cornering_stiffness_rls,
+    cornering_stiffness_used,
     speed_cmd,
     turn_cmd,
     delta_f_cmd_est,
@@ -398,6 +402,94 @@ def build_debug_snapshot(
         inner_Bm_0_text = "None"
         inner_Bm_1_text = "None"
 
+    if cornering_stiffness_outputs is not None:
+        rls_valid_text = str(cornering_stiffness_outputs.valid)
+        rls_reason_text = cornering_stiffness_outputs.reason
+        rls_dt_text = f"{cornering_stiffness_outputs.dt_s:.4f}"
+        rls_y1_ay_raw_text = f"{cornering_stiffness_outputs.ay_raw_ms2:.3f}"
+        rls_y1_ay_text = f"{cornering_stiffness_outputs.ay_filt_ms2:.3f}"
+        rls_y2_rdot_raw_text = f"{cornering_stiffness_outputs.r_dot_raw_rad_s2:.3f}"
+        rls_y2_rdot_text = f"{cornering_stiffness_outputs.r_dot_filt_rad_s2:.3f}"
+        rls_tv_corr_text = f"{cornering_stiffness_outputs.tv_correction_rad_s2:.3f}"
+        rls_y2_corr_text = f"{cornering_stiffness_outputs.y2_corr_rad_s2:.3f}"
+    else:
+        rls_valid_text = "False"
+        rls_reason_text = "None"
+        rls_dt_text = "None"
+        rls_y1_ay_raw_text = "None"
+        rls_y1_ay_text = "None"
+        rls_y2_rdot_raw_text = "None"
+        rls_y2_rdot_text = "None"
+        rls_tv_corr_text = "None"
+        rls_y2_corr_text = "None"
+
+    if cornering_stiffness_matrix is not None:
+        rls_phi_valid_text = str(cornering_stiffness_matrix.valid)
+        rls_phi_excited_text = str(cornering_stiffness_matrix.excited)
+        rls_phi_ready_text = str(cornering_stiffness_matrix.ready_for_update)
+        rls_phi_reason_text = cornering_stiffness_matrix.reason
+        rls_ycorr_0_text = f"{cornering_stiffness_matrix.y_corr_0:.3f}"
+        rls_ycorr_1_text = f"{cornering_stiffness_matrix.y_corr_1:.3f}"
+        rls_phi_00_text = f"{cornering_stiffness_matrix.phi_00:.4f}"
+        rls_phi_01_text = f"{cornering_stiffness_matrix.phi_01:.4f}"
+        rls_phi_10_text = f"{cornering_stiffness_matrix.phi_10:.4f}"
+        rls_phi_11_text = f"{cornering_stiffness_matrix.phi_11:.4f}"
+        rls_phi_norm_text = f"{cornering_stiffness_matrix.phi_norm:.4f}"
+    else:
+        rls_phi_valid_text = "False"
+        rls_phi_excited_text = "False"
+        rls_phi_ready_text = "False"
+        rls_phi_reason_text = "None"
+        rls_ycorr_0_text = "None"
+        rls_ycorr_1_text = "None"
+        rls_phi_00_text = "None"
+        rls_phi_01_text = "None"
+        rls_phi_10_text = "None"
+        rls_phi_11_text = "None"
+        rls_phi_norm_text = "None"
+
+    if cornering_stiffness_rls is not None:
+        rls_est_valid_text = str(cornering_stiffness_rls.valid)
+        rls_est_update_text = str(cornering_stiffness_rls.updated)
+        rls_est_reason_text = cornering_stiffness_rls.reason
+        rls_update_count_text = str(cornering_stiffness_rls.update_count)
+        c_alpha_f_hat_text = f"{cornering_stiffness_rls.c_alpha_f_hat:.3f}"
+        c_alpha_r_hat_text = f"{cornering_stiffness_rls.c_alpha_r_hat:.3f}"
+        rls_err_0_text = f"{cornering_stiffness_rls.error_0:.3f}"
+        rls_err_1_text = f"{cornering_stiffness_rls.error_1:.3f}"
+        rls_gain_00_text = f"{cornering_stiffness_rls.gain_00:.4f}"
+        rls_gain_01_text = f"{cornering_stiffness_rls.gain_01:.4f}"
+        rls_gain_10_text = f"{cornering_stiffness_rls.gain_10:.4f}"
+        rls_gain_11_text = f"{cornering_stiffness_rls.gain_11:.4f}"
+        rls_p_trace_text = f"{cornering_stiffness_rls.p_trace:.3f}"
+    else:
+        rls_est_valid_text = "False"
+        rls_est_update_text = "False"
+        rls_est_reason_text = "None"
+        rls_update_count_text = "0"
+        c_alpha_f_hat_text = "None"
+        c_alpha_r_hat_text = "None"
+        rls_err_0_text = "None"
+        rls_err_1_text = "None"
+        rls_gain_00_text = "None"
+        rls_gain_01_text = "None"
+        rls_gain_10_text = "None"
+        rls_gain_11_text = "None"
+        rls_p_trace_text = "None"
+
+    if cornering_stiffness_used is not None:
+        rls_used_ready_text = str(cornering_stiffness_used.ready)
+        rls_used_frozen_text = str(cornering_stiffness_used.frozen)
+        rls_used_reason_text = cornering_stiffness_used.reason
+        c_alpha_f_used_text = f"{cornering_stiffness_used.c_alpha_f_used:.3f}"
+        c_alpha_r_used_text = f"{cornering_stiffness_used.c_alpha_r_used:.3f}"
+    else:
+        rls_used_ready_text = "False"
+        rls_used_frozen_text = "True"
+        rls_used_reason_text = "not_initialized"
+        c_alpha_f_used_text = "None"
+        c_alpha_r_used_text = "None"
+
     debug_map = {
         "turn_cmd": f"turn_cmd={turn_cmd:.3f}",
         "speed_cmd": f"speed_cmd={speed_cmd:.3f}",
@@ -520,6 +612,38 @@ def build_debug_snapshot(
         "inner_Am_11": f"inner_Am_11={inner_Am_11_text}",
         "inner_Bm_0": f"inner_Bm_0={inner_Bm_0_text}",
         "inner_Bm_1": f"inner_Bm_1={inner_Bm_1_text}",
+        "rls_out_valid": f"rls_out_valid={rls_valid_text}",
+        "rls_out_reason": f"rls_out_reason={rls_reason_text}",
+        "rls_dt": f"rls_dt={rls_dt_text}",
+        "rls_y1_ay_raw": f"rls_y1_ay_raw={rls_y1_ay_raw_text}",
+        "rls_y1_ay": f"rls_y1_ay={rls_y1_ay_text}",
+        "rls_y2_rdot_raw": f"rls_y2_rdot_raw={rls_y2_rdot_raw_text}",
+        "rls_y2_rdot": f"rls_y2_rdot={rls_y2_rdot_text}",
+        "rls_tv_corr": f"rls_tv_corr={rls_tv_corr_text}",
+        "rls_y2_corr": f"rls_y2_corr={rls_y2_corr_text}",
+        "rls_phi_valid": f"rls_phi_valid={rls_phi_valid_text}",
+        "rls_phi_excited": f"rls_phi_excited={rls_phi_excited_text}",
+        "rls_phi_ready": f"rls_phi_ready={rls_phi_ready_text}",
+        "rls_phi_reason": f"rls_phi_reason={rls_phi_reason_text}",
+        "rls_ycorr_0": f"rls_ycorr_0={rls_ycorr_0_text}",
+        "rls_ycorr_1": f"rls_ycorr_1={rls_ycorr_1_text}",
+        "rls_phi_00": f"rls_phi_00={rls_phi_00_text}",
+        "rls_phi_01": f"rls_phi_01={rls_phi_01_text}",
+        "rls_phi_10": f"rls_phi_10={rls_phi_10_text}",
+        "rls_phi_11": f"rls_phi_11={rls_phi_11_text}",
+        "rls_phi_norm": f"rls_phi_norm={rls_phi_norm_text}",
+        "rls_est_valid": f"rls_est_valid={rls_est_valid_text}",
+        "rls_est_update": f"rls_est_update={rls_est_update_text}",
+        "rls_est_reason": f"rls_est_reason={rls_est_reason_text}",
+        "rls_update_count": f"rls_update_count={rls_update_count_text}",
+        "c_alpha_f_hat": f"c_alpha_f_hat={c_alpha_f_hat_text}",
+        "c_alpha_r_hat": f"c_alpha_r_hat={c_alpha_r_hat_text}",
+        "rls_p_trace": f"rls_p_trace={rls_p_trace_text}",
+        "rls_used_ready": f"rls_used_ready={rls_used_ready_text}",
+        "rls_used_frozen": f"rls_used_frozen={rls_used_frozen_text}",
+        "rls_used_reason": f"rls_used_reason={rls_used_reason_text}",
+        "c_alpha_f_used": f"c_alpha_f_used={c_alpha_f_used_text}",
+        "c_alpha_r_used": f"c_alpha_r_used={c_alpha_r_used_text}",
 
         "beta_kin": f"beta_kin={beta_text}",
         "x_dot_kin": f"x_dot_kin={xdot_text}",

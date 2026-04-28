@@ -69,6 +69,10 @@ from .models.inner_reference_command import InnerReferenceCommandModel
 from .models.inner_lateral_yaw_reference import InnerLateralYawReferenceModel
 from .models.speed_scheduler import FilteredSpeedScheduler
 from .models.battery_gain_estimator import BatteryGainEstimator
+from .models.cornering_stiffness_regression_outputs import CorneringStiffnessRegressionOutputModel
+from .models.cornering_stiffness_regression_matrix import CorneringStiffnessRegressionMatrixModel
+from .models.cornering_stiffness_rls_estimator import CorneringStiffnessRLSModel
+from .models.cornering_stiffness_used_estimate import CorneringStiffnessUsedEstimateModel
 
 class LineFollower(Node):
     """Line follower node with baseline control and MRAC/model scaffolding."""
@@ -254,6 +258,61 @@ class LineFollower(Node):
             max_scale=cfg.BATTERY_GAIN_EST_MAX_SCALE,
         )
 
+        self.cornering_regression_output_model = CorneringStiffnessRegressionOutputModel(
+            min_dt_s=cfg.RLS_OUTPUT_MIN_DT_S,
+            max_dt_s=cfg.RLS_OUTPUT_MAX_DT_S,
+            filter_alpha=cfg.RLS_OUTPUT_FILTER_ALPHA,
+            min_vx_ms=cfg.RLS_OUTPUT_MIN_VX_MS,
+            max_abs_ay_ms2=cfg.RLS_OUTPUT_MAX_ABS_AY_MS2,
+            max_abs_r_dot_rad_s2=cfg.RLS_OUTPUT_MAX_ABS_R_DOT_RAD_S2,
+            rear_track_width_m=cfg.REAR_TRACK_WIDTH_M,
+            iz_kg_m2=cfg.DYNAMIC_BICYCLE_IZ_KG_M2,
+        )
+        self.cornering_regression_matrix_model = CorneringStiffnessRegressionMatrixModel(
+            mass_kg=cfg.DYNAMIC_BICYCLE_MASS_KG,
+            iz_kg_m2=cfg.DYNAMIC_BICYCLE_IZ_KG_M2,
+            lf_m=cfg.DYNAMIC_BICYCLE_LF_M,
+            lr_m=cfg.DYNAMIC_BICYCLE_LR_M,
+            min_vx_ms=cfg.RLS_MATRIX_MIN_VX_MS,
+            min_excitation_norm=cfg.RLS_MATRIX_MIN_EXCITATION_NORM,
+        )
+
+        self.cornering_stiffness_rls_model = CorneringStiffnessRLSModel(
+            initial_c_alpha_f=cfg.RLS_EST_INITIAL_C_ALPHA_F_N_PER_RAD,
+            initial_c_alpha_r=cfg.RLS_EST_INITIAL_C_ALPHA_R_N_PER_RAD,
+            p0=cfg.RLS_EST_INITIAL_COVARIANCE,
+            lambda_forgetting=cfg.RLS_EST_LAMBDA,
+            min_c_alpha=cfg.RLS_EST_MIN_C_ALPHA_N_PER_RAD,
+            max_c_alpha=cfg.RLS_EST_MAX_C_ALPHA_N_PER_RAD,
+            min_det=cfg.RLS_EST_MIN_DET,
+            max_covariance=cfg.RLS_EST_MAX_COVARIANCE,
+            min_update_vx_ms=cfg.RLS_PROTECT_MIN_UPDATE_VX_MS,
+            min_abs_delta_rad=cfg.RLS_PROTECT_MIN_ABS_DELTA_RAD,
+            min_abs_r_rad_s=cfg.RLS_PROTECT_MIN_ABS_R_RAD_S,
+            min_phi_norm=cfg.RLS_PROTECT_MIN_PHI_NORM,
+            max_abs_ycorr_0=cfg.RLS_PROTECT_MAX_ABS_YCORR_0,
+            max_abs_ycorr_1=cfg.RLS_PROTECT_MAX_ABS_YCORR_1,
+            update_every_n_ready=cfg.RLS_PROTECT_UPDATE_EVERY_N_READY,
+            max_abs_parameter_step=cfg.RLS_PROTECT_MAX_ABS_PARAMETER_STEP,
+            max_relative_parameter_step=cfg.RLS_PROTECT_MAX_RELATIVE_PARAMETER_STEP,
+            sigma_pullback_alpha=cfg.RLS_PROTECT_SIGMA_PULLBACK_ALPHA,
+        )
+
+        self.cornering_stiffness_used_model = CorneringStiffnessUsedEstimateModel(
+            nominal_c_alpha_f_n_per_rad=cfg.RLS_USED_NOMINAL_C_ALPHA_F_N_PER_RAD,
+            nominal_c_alpha_r_n_per_rad=cfg.RLS_USED_NOMINAL_C_ALPHA_R_N_PER_RAD,
+            min_c_alpha_n_per_rad=cfg.RLS_USED_MIN_C_ALPHA_N_PER_RAD,
+            max_c_alpha_n_per_rad=cfg.RLS_USED_MAX_C_ALPHA_N_PER_RAD,
+            ready_min_updates=cfg.RLS_USED_READY_MIN_UPDATES,
+            max_p_trace=cfg.RLS_USED_MAX_P_TRACE,
+            filter_alpha=cfg.RLS_USED_FILTER_ALPHA,
+        )
+
+        self.latest_cornering_regression_outputs = None
+        self.latest_cornering_regression_matrix = None
+        self.latest_cornering_stiffness_rls = None
+        self.latest_cornering_stiffness_used = self.cornering_stiffness_used_model.current()
+
         self.latest_battery_gain_estimate = None
 
         self.kinematic_state_est = None
@@ -366,6 +425,10 @@ class LineFollower(Node):
             outer_reference=self.latest_outer_reference,
             inner_reference_command=self.latest_inner_reference_command,
             inner_lateral_yaw_reference=self.latest_inner_lateral_yaw_reference,
+            cornering_stiffness_outputs=self.latest_cornering_regression_outputs,
+            cornering_stiffness_matrix=self.latest_cornering_regression_matrix,
+            cornering_stiffness_rls=self.latest_cornering_stiffness_rls,
+            cornering_stiffness_used=self.latest_cornering_stiffness_used,
             speed_cmd=self.last_speed_cmd,
             turn_cmd=self.controller.last_turn_cmd,
             delta_f_cmd_est=self.delta_f_cmd_est,
@@ -480,6 +543,30 @@ class LineFollower(Node):
         torque_vectoring_yaw_moment_n_m = (
             DYNAMIC_TORQUE_VECTORING_YAW_MOMENT_N_M
             + self.latest_wheel_forces.torque_vectoring_yaw_moment_n_m
+        )
+
+        self.latest_cornering_regression_outputs = self.cornering_regression_output_model.update(
+            vx_ms=vehicle.vx_recon,
+            vy_ms=vehicle.vy_recon,
+            r_rad_s=vehicle.r_recon,
+            dfx_n=self.latest_wheel_forces.dfx_n,
+            dt_s=dt_s,
+        )
+
+        self.latest_cornering_regression_matrix = self.cornering_regression_matrix_model.build(
+            vx_ms=vehicle.vx_recon,
+            vy_ms=vehicle.vy_recon,
+            r_rad_s=vehicle.r_recon,
+            delta_f_rad=self.delta_f_cmd_est,
+            outputs=self.latest_cornering_regression_outputs,
+        )
+
+        self.latest_cornering_stiffness_rls = self.cornering_stiffness_rls_model.update(
+            self.latest_cornering_regression_matrix
+        )
+
+        self.latest_cornering_stiffness_used = self.cornering_stiffness_used_model.update(
+            self.latest_cornering_stiffness_rls
         )
 
         self.latest_inner_speed_schedule = self.inner_speed_scheduler.update(

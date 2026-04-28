@@ -265,6 +265,74 @@ BATTERY_GAIN_EST_MIN_SCALE = 0.50
 BATTERY_GAIN_EST_MAX_SCALE = 1.50
 
 # ============================================================
+# TASK 5.2 CORNERING-STIFFNESS RLS OUTPUT SCAFFOLD
+# ------------------------------------------------------------
+# Report outputs:
+#
+# y1 = a_y,meas = v_y_dot + v_x * r
+# y2 = r_dot
+# y2_corr = r_dot - (rear_track_width / (2 * I_z)) * Delta_Fx
+#
+# For now, a_y is reconstructed from odometry-based v_y and r.
+# Later, this can be replaced by true IMU lateral acceleration.
+# ============================================================
+RLS_OUTPUT_MIN_DT_S = 0.0001
+RLS_OUTPUT_MAX_DT_S = 0.20
+RLS_OUTPUT_FILTER_ALPHA = 0.15
+RLS_OUTPUT_MIN_VX_MS = 0.10
+RLS_OUTPUT_MAX_ABS_AY_MS2 = 12.0
+RLS_OUTPUT_MAX_ABS_R_DOT_RAD_S2 = 25.0
+
+# ============================================================
+# TASK 5.3 CORNERING-STIFFNESS RLS REGRESSION MATRIX
+# ------------------------------------------------------------
+# This threshold does not estimate C_alpha yet.
+# It only marks whether Phi has enough magnitude to be useful
+# for a future RLS update.
+# ============================================================
+RLS_MATRIX_MIN_VX_MS = RLS_OUTPUT_MIN_VX_MS
+RLS_MATRIX_MIN_EXCITATION_NORM = 0.015
+
+# ============================================================
+# TASK 5.4 CORNERING-STIFFNESS RLS ESTIMATOR
+# ------------------------------------------------------------
+# Estimates theta = [C_alpha_f, C_alpha_r]^T from:
+#
+# y_corr = Phi * theta
+#
+# These values are still scaffold/debug estimates only.
+# They are not used for control yet.
+# ============================================================
+RLS_EST_INITIAL_C_ALPHA_F_N_PER_RAD = 8.0
+RLS_EST_INITIAL_C_ALPHA_R_N_PER_RAD = 8.0
+RLS_EST_INITIAL_COVARIANCE = 1.0
+RLS_EST_LAMBDA = 0.998
+RLS_EST_MIN_C_ALPHA_N_PER_RAD = 2.0
+RLS_EST_MAX_C_ALPHA_N_PER_RAD = 25.0
+RLS_EST_MIN_DET = 1.0e-9
+RLS_EST_MAX_COVARIANCE = 100.0
+
+# ============================================================
+# TASK 5.5 RLS ESTIMATOR PROTECTIONS
+# ------------------------------------------------------------
+# These gates prevent the RLS estimator from adapting on weak,
+# noisy, low-speed, or derivative-spike-dominated samples.
+# They keep the estimator as a safe scaffold before it is ever
+# used by the controller.
+# ============================================================
+RLS_PROTECT_MIN_UPDATE_VX_MS = 0.35
+RLS_PROTECT_MIN_ABS_DELTA_RAD = 0.035
+RLS_PROTECT_MIN_ABS_R_RAD_S = 0.04
+RLS_PROTECT_MIN_PHI_NORM = 0.05
+RLS_PROTECT_MAX_ABS_YCORR_0 = 0.12
+RLS_PROTECT_MAX_ABS_YCORR_1 = 0.25
+RLS_PROTECT_UPDATE_EVERY_N_READY = 6
+RLS_PROTECT_MAX_ABS_PARAMETER_STEP = 0.02
+RLS_PROTECT_MAX_RELATIVE_PARAMETER_STEP = 0.01
+RLS_PROTECT_SIGMA_PULLBACK_ALPHA = 0.0005
+
+
+# ============================================================
 # DEBUG FIELD SELECTION
 # ------------------------------------------------------------
 # Task 2.5 / 2.6 validation only.
@@ -308,4 +376,64 @@ DEBUG_FIELDS = [
     "batt_reason",
     "r_recon",
     "delta_f_est_deg",
+    "rls_out_valid",
+    "rls_out_reason",
+    "rls_dt",
+    "rls_y1_ay_raw",
+    "rls_y1_ay",
+    "rls_y2_rdot_raw",
+    "rls_y2_rdot",
+    "rls_tv_corr",
+    "rls_y2_corr",
+    "rls_phi_valid",
+    "rls_phi_excited",
+    "rls_phi_ready",
+    "rls_phi_reason",
+    "rls_ycorr_0",
+    "rls_ycorr_1",
+    "rls_phi_00",
+    "rls_phi_01",
+    "rls_phi_10",
+    "rls_phi_11",
+    "rls_phi_norm",
+    "rls_est_valid",
+    "rls_est_update",
+    "rls_est_reason",
+    "rls_update_count",
+    "c_alpha_f_hat",
+    "c_alpha_r_hat",
+    "rls_err_0",
+    "rls_err_1",
+    "rls_gain_00",
+    "rls_gain_01",
+    "rls_gain_10",
+    "rls_gain_11",
+    "rls_p_trace",
 ]
+
+
+# ============================================================
+# Task 5.6: safe controller-facing cornering-stiffness outputs
+# ============================================================
+
+if "RLS_USED_NOMINAL_C_ALPHA_F_N_PER_RAD" not in globals():
+    RLS_USED_NOMINAL_C_ALPHA_F_N_PER_RAD = 8.0
+
+if "RLS_USED_NOMINAL_C_ALPHA_R_N_PER_RAD" not in globals():
+    RLS_USED_NOMINAL_C_ALPHA_R_N_PER_RAD = 8.0
+
+if "RLS_USED_MIN_C_ALPHA_N_PER_RAD" not in globals():
+    RLS_USED_MIN_C_ALPHA_N_PER_RAD = 0.5
+
+if "RLS_USED_MAX_C_ALPHA_N_PER_RAD" not in globals():
+    RLS_USED_MAX_C_ALPHA_N_PER_RAD = 30.0
+
+if "RLS_USED_READY_MIN_UPDATES" not in globals():
+    RLS_USED_READY_MIN_UPDATES = 4
+
+if "RLS_USED_MAX_P_TRACE" not in globals():
+    RLS_USED_MAX_P_TRACE = 20.0
+
+if "RLS_USED_FILTER_ALPHA" not in globals():
+    RLS_USED_FILTER_ALPHA = 0.20
+
