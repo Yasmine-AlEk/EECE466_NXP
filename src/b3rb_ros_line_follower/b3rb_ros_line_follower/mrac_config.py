@@ -357,44 +357,12 @@ INNER_REF_MIN_VX_MS = 0.20
 DEBUG_FIELDS = [
     "speed_cmd",
     "vx_recon",
-    "a_long_filt",
-    "pwm_cmd",
-    "outer_vx_loss",
-    "outer_vx_dot_propulsion",
-    "outer_vx_dot_pred",
-    "outer_d_x_est",
-    "outer_b_batt_est",
-    "batt_gain_valid",
-    "batt_gain_update",
-    "batt_b_nom",
-    "batt_b_voltage",
-    "batt_b_inst",
-    "batt_b_hat",
-    "batt_b_error",
-    "batt_alpha",
-    "batt_pred_vx_dot_hat",
-    "batt_reason",
     "r_recon",
     "delta_f_est_deg",
     "rls_out_valid",
     "rls_out_reason",
-    "rls_dt",
-    "rls_y1_ay_raw",
-    "rls_y1_ay",
-    "rls_y2_rdot_raw",
-    "rls_y2_rdot",
-    "rls_tv_corr",
-    "rls_y2_corr",
-    "rls_phi_valid",
-    "rls_phi_excited",
     "rls_phi_ready",
     "rls_phi_reason",
-    "rls_ycorr_0",
-    "rls_ycorr_1",
-    "rls_phi_00",
-    "rls_phi_01",
-    "rls_phi_10",
-    "rls_phi_11",
     "rls_phi_norm",
     "rls_est_valid",
     "rls_est_update",
@@ -402,13 +370,16 @@ DEBUG_FIELDS = [
     "rls_update_count",
     "c_alpha_f_hat",
     "c_alpha_r_hat",
-    "rls_err_0",
-    "rls_err_1",
-    "rls_gain_00",
-    "rls_gain_01",
-    "rls_gain_10",
-    "rls_gain_11",
     "rls_p_trace",
+    "rls_used_ready",
+    "rls_used_frozen",
+    "rls_used_reason",
+    "c_alpha_f_used",
+    "c_alpha_r_used",
+    "batt_gain_valid",
+    "batt_gain_update",
+    "batt_b_hat",
+    "batt_reason",
 ]
 
 
@@ -437,3 +408,22 @@ if "RLS_USED_MAX_P_TRACE" not in globals():
 if "RLS_USED_FILTER_ALPHA" not in globals():
     RLS_USED_FILTER_ALPHA = 0.20
 
+# ================= Task 6.0 MRAC safety scaffold =================
+# These are safe defaults before MRAC is allowed to affect the car.
+# Shadow mode means MRAC may be computed/logged later, but not applied to commands.
+
+MRAC_ENABLE_INNER = False
+MRAC_ENABLE_OUTER = False
+MRAC_SHADOW_MODE = True
+
+# Conservative future correction limits.
+MRAC_MAX_STEERING_CORRECTION_RAD = 0.05
+MRAC_MAX_SPEED_CORRECTION_MPS = 0.05
+MRAC_MAX_PWM_CORRECTION = 0.05
+MRAC_MAX_DELTA_FX_N = 0.30
+
+# Minimum conditions before future MRAC terms are trusted.
+MRAC_MIN_CONTROL_VX_MS = 0.45
+MRAC_REQUIRE_RLS_USED_READY = True
+MRAC_FREEZE_WHEN_RLS_USED_NOT_READY = True
+# ================= End Task 6.0 MRAC safety scaffold =================
