@@ -427,3 +427,149 @@ MRAC_MIN_CONTROL_VX_MS = 0.45
 MRAC_REQUIRE_RLS_USED_READY = True
 MRAC_FREEZE_WHEN_RLS_USED_NOT_READY = True
 # ================= End Task 6.0 MRAC safety scaffold =================
+
+
+# ============================================================
+# TASK 6.1: OUTER-LOOP MRAC ADAPTIVE CONTROL LAW
+# ------------------------------------------------------------
+# Report control law:
+#
+#     PWM = k_r_hat * vx_ref - k_x_hat * vx
+#
+# This is integrated in shadow mode by default:
+#   - adaptation is allowed for validation
+#   - final command sent to the car remains the baseline PID speed command
+# ============================================================
+
+OUTER_MRAC_ENABLE_ADAPTATION = True
+OUTER_MRAC_APPLY_TO_SPEED_CMD = False
+
+OUTER_MRAC_B_NOMINAL_MS2_PER_PWM = BATTERY_GAIN_EST_NOMINAL_MS2_PER_PWM
+
+OUTER_MRAC_KR_NOMINAL = (
+    OUTER_REFERENCE_A_M_S_INV
+    / max(OUTER_MRAC_B_NOMINAL_MS2_PER_PWM, 1.0e-6)
+)
+
+OUTER_MRAC_KX_NOMINAL = max(
+    0.0,
+    (OUTER_REFERENCE_A_M_S_INV - OUTER_LONGITUDINAL_K_V_S)
+    / max(OUTER_MRAC_B_NOMINAL_MS2_PER_PWM, 1.0e-6)
+)
+
+OUTER_MRAC_KR_INITIAL = OUTER_MRAC_KR_NOMINAL
+OUTER_MRAC_KX_INITIAL = OUTER_MRAC_KX_NOMINAL
+
+# keep these smaller/slower than the future inner-loop adaptation
+OUTER_MRAC_GAMMA_KR = 0.04
+OUTER_MRAC_GAMMA_KX = 0.04
+OUTER_MRAC_SIGMA = 0.02
+
+OUTER_MRAC_KR_MIN = 0.20
+OUTER_MRAC_KR_MAX = 4.00
+OUTER_MRAC_KX_MIN = 0.00
+OUTER_MRAC_KX_MAX = 3.00
+
+OUTER_MRAC_MIN_UPDATE_VX_MS = 0.35
+OUTER_MRAC_MIN_ABS_PWM = 0.25
+OUTER_MRAC_MIN_PHI_NORM = 0.05
+OUTER_MRAC_MAX_ABS_EX_MS = 0.35
+
+# outer adaptation should mostly learn on straights, not during cornering
+OUTER_MRAC_MAX_ABS_R_RAD_S = BATTERY_GAIN_EST_MAX_ABS_R_RAD_S
+OUTER_MRAC_MAX_ABS_DELTA_RAD = BATTERY_GAIN_EST_MAX_ABS_DELTA_RAD
+
+OUTER_MRAC_MIN_B_HAT_MS2_PER_PWM = 0.20
+OUTER_MRAC_MAX_ABS_THETA_DOT = 0.30
+
+
+# Add Task 6.1 fields to the existing debug selection.
+for _field in [
+    "outer_mrac_valid",
+    "outer_mrac_adapt",
+    "outer_mrac_update",
+    "outer_mrac_applied",
+    "outer_mrac_reason",
+    "outer_ex",
+    "outer_vx_m",
+    "outer_vx_ref",
+    "outer_phi_norm",
+    "outer_k_r_hat",
+    "outer_k_x_hat",
+    "outer_k_r_dot",
+    "outer_k_x_dot",
+    "outer_theta_norm",
+    "outer_pwm_baseline",
+    "outer_pwm_raw",
+    "outer_pwm_sat",
+    "outer_pwm_final",
+    "outer_b_hat",
+]:
+    if _field not in DEBUG_FIELDS:
+        DEBUG_FIELDS.append(_field)
+
+# ============================================================
+# TASK 6.1B: OUTER MRAC SHADOW-MODE NOMINAL GAIN CALIBRATION
+# ------------------------------------------------------------
+# From the shadow-mode logs:
+#
+#   steady cruise:
+#       vx_ref ≈ vx ≈ 0.55 m/s
+#       baseline PWM ≈ 0.55
+#       raw MRAC PWM ≈ 0.48
+#
+# Since the report law is:
+#
+#   PWM = k_r_hat * vx_ref - k_x_hat * vx
+#
+# then at steady state vx_ref ≈ vx:
+#
+#   PWM ≈ (k_r_hat - k_x_hat) * vx
+#
+# For the current simulator/baseline, the steady relation is roughly:
+#
+#   PWM / vx ≈ 1.0
+#
+# So we choose:
+#
+#   k_r_nominal - k_x_nominal ≈ 1.0
+#
+# This keeps the report control-law structure, but makes the initial
+# adaptive controller closer to the known-good baseline before activation.
+# ============================================================
+
+OUTER_MRAC_STEADY_PWM_PER_VX_NOMINAL = 1.00
+
+OUTER_MRAC_KX_NOMINAL = max(
+    0.0,
+    OUTER_MRAC_KR_NOMINAL - OUTER_MRAC_STEADY_PWM_PER_VX_NOMINAL,
+)
+
+OUTER_MRAC_KX_INITIAL = OUTER_MRAC_KX_NOMINAL
+
+# Make adaptation more conservative before activation.
+# This blocks update on speed-estimation spikes and low-speed corner regions.
+OUTER_MRAC_MIN_UPDATE_VX_MS = 0.45
+OUTER_MRAC_MAX_ABS_EX_MS = 0.10
+OUTER_MRAC_MAX_ABS_THETA_DOT = 0.20
+
+# Still keep MRAC in shadow mode.
+OUTER_MRAC_APPLY_TO_SPEED_CMD = False
+
+# ============================================================
+# TASK 6.1C: OUTER MRAC BLENDED ACTIVATION
+# ------------------------------------------------------------
+# Enable outer MRAC in a conservative blended mode.
+# The adaptive command is not sent directly.
+#
+# Sent PWM:
+#   pwm_final = pwm_baseline + alpha * (pwm_adaptive_sat - pwm_baseline)
+#
+# With alpha = 0.10, the baseline controller still provides 90% of the command.
+# The additional correction is also capped for safety.
+# ============================================================
+
+OUTER_MRAC_APPLY_TO_SPEED_CMD = True
+OUTER_MRAC_APPLY_BLEND_ALPHA = 0.10
+OUTER_MRAC_MAX_APPLIED_PWM_DELTA = 0.03
+

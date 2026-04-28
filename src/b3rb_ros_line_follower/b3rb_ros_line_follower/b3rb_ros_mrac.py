@@ -19,6 +19,7 @@ from .models.dynamic_bicycle import DynamicBicycleModel
 from .models.kinematic_bicycle import KinematicBicycleModel
 from .models.outer_longitudinal_reduced import OuterLongitudinalReducedModel
 from .models.outer_longitudinal_reference import OuterLongitudinalReferenceModel
+from .models.outer_mrac_controller import OuterMRACController
 from .models.state_space_vehicle import StateSpaceVehicleModel
 from .models.wheel_force_decomposition import WheelForceDecompositionModel
 from .mrac_config import (
@@ -201,6 +202,63 @@ class LineFollower(Node):
             max_vx_ref_ms=cfg.OUTER_REFERENCE_MAX_VX_REF_MS,
             max_dt_s=cfg.OUTER_REFERENCE_MAX_DT_S,
         )
+
+        self.outer_mrac_controller = OuterMRACController(
+
+            k_r_initial=cfg.OUTER_MRAC_KR_INITIAL,
+
+            k_x_initial=cfg.OUTER_MRAC_KX_INITIAL,
+
+            k_r_nominal=cfg.OUTER_MRAC_KR_NOMINAL,
+
+            k_x_nominal=cfg.OUTER_MRAC_KX_NOMINAL,
+
+            gamma_k_r=cfg.OUTER_MRAC_GAMMA_KR,
+
+            gamma_k_x=cfg.OUTER_MRAC_GAMMA_KX,
+
+            sigma=cfg.OUTER_MRAC_SIGMA,
+
+            min_k_r=cfg.OUTER_MRAC_KR_MIN,
+
+            max_k_r=cfg.OUTER_MRAC_KR_MAX,
+
+            min_k_x=cfg.OUTER_MRAC_KX_MIN,
+
+            max_k_x=cfg.OUTER_MRAC_KX_MAX,
+
+            min_vx_ms=cfg.OUTER_MRAC_MIN_UPDATE_VX_MS,
+
+            min_abs_pwm=cfg.OUTER_MRAC_MIN_ABS_PWM,
+
+            min_phi_norm=cfg.OUTER_MRAC_MIN_PHI_NORM,
+
+            max_abs_ex_ms=cfg.OUTER_MRAC_MAX_ABS_EX_MS,
+
+            max_abs_r_rad_s=cfg.OUTER_MRAC_MAX_ABS_R_RAD_S,
+
+            max_abs_delta_rad=cfg.OUTER_MRAC_MAX_ABS_DELTA_RAD,
+
+            min_b_hat_ms2_per_pwm=cfg.OUTER_MRAC_MIN_B_HAT_MS2_PER_PWM,
+
+            max_abs_theta_dot=cfg.OUTER_MRAC_MAX_ABS_THETA_DOT,
+
+            enable_adaptation=cfg.OUTER_MRAC_ENABLE_ADAPTATION,
+
+            apply_to_speed_cmd=cfg.OUTER_MRAC_APPLY_TO_SPEED_CMD,
+
+            apply_blend_alpha=cfg.OUTER_MRAC_APPLY_BLEND_ALPHA,
+
+            max_applied_pwm_delta=cfg.OUTER_MRAC_MAX_APPLIED_PWM_DELTA,
+
+            pwm_min=cfg.SPEED_MIN,
+
+            pwm_max=cfg.SPEED_MAX,
+
+        )
+
+        self.latest_outer_mrac = None
+
 
         self.inner_lateral_yaw_model = InnerLateralYawReducedModel(
             mass_kg=cfg.DYNAMIC_BICYCLE_MASS_KG,
@@ -621,6 +679,50 @@ class LineFollower(Node):
             )
 
 
+        b_hat_for_outer_mrac = cfg.BATTERY_GAIN_EST_NOMINAL_MS2_PER_PWM
+
+
+        if self.latest_battery_gain_estimate is not None:
+
+
+            b_hat_for_outer_mrac = (
+
+
+                self.latest_battery_gain_estimate.b_hat_ms2_per_pwm
+
+
+            )
+
+
+
+        self.latest_outer_mrac = self.outer_mrac_controller.update(
+
+
+            vx_ms=vehicle.vx_recon,
+
+
+            reference_output=self.latest_outer_reference,
+
+
+            pwm_baseline=self.last_speed_cmd,
+
+
+            r_rad_s=vehicle.r_recon,
+
+
+            delta_f_rad=self.delta_f_cmd_est,
+
+
+            b_hat_ms2_per_pwm=b_hat_for_outer_mrac,
+
+
+            dt_s=dt_s,
+
+
+        )
+
+
+
         if (
             self.latest_camera_measurement is not None
             and self.latest_inner_lateral_yaw is not None
@@ -708,7 +810,14 @@ class LineFollower(Node):
         self.update_kinematic_bicycle_model(dt_s)
         self.update_dynamic_bicycle_model(dt_s)
 
-        self.rover_move_manual_mode(speed_cmd, turn_cmd)
+        speed_cmd_to_send = speed_cmd
+        if (
+            cfg.OUTER_MRAC_APPLY_TO_SPEED_CMD
+            and self.latest_outer_mrac is not None
+            and self.latest_outer_mrac.applied
+        ):
+            speed_cmd_to_send = self.latest_outer_mrac.pwm_final
+        self.rover_move_manual_mode(speed_cmd_to_send, turn_cmd)
 
     def odometry_callback(self, message):
         prev_vx_recon = self.estimator.vehicle.vx_recon
@@ -788,6 +897,139 @@ class LineFollower(Node):
             for field_name in cfg.DEBUG_FIELDS:
                 if field_name in battery_debug_map:
                     snapshot_to_print.append(battery_debug_map[field_name])
+
+        outer_mrac = self.latest_outer_mrac
+
+        if outer_mrac is not None:
+
+            outer_mrac_debug_map = {
+
+                "outer_mrac_valid": (
+
+                    f"outer_mrac_valid={outer_mrac.valid}"
+
+                ),
+
+                "outer_mrac_adapt": (
+
+                    f"outer_mrac_adapt={outer_mrac.adaptation_enabled}"
+
+                ),
+
+                "outer_mrac_update": (
+
+                    f"outer_mrac_update={outer_mrac.update_enabled}"
+
+                ),
+
+                "outer_mrac_applied": (
+
+                    f"outer_mrac_applied={outer_mrac.applied}"
+
+                ),
+
+                "outer_mrac_reason": (
+
+                    f"outer_mrac_reason={outer_mrac.reason}"
+
+                ),
+
+                "outer_ex": (
+
+                    f"outer_ex={outer_mrac.ex_ms:.3f}"
+
+                ),
+
+                "outer_vx_m": (
+
+                    f"outer_vx_m={outer_mrac.vx_m_ms:.3f}"
+
+                ),
+
+                "outer_vx_ref": (
+
+                    f"outer_vx_ref={outer_mrac.vx_ref_ms:.3f}"
+
+                ),
+
+                "outer_phi_norm": (
+
+                    f"outer_phi_norm={outer_mrac.phi_norm:.4f}"
+
+                ),
+
+                "outer_k_r_hat": (
+
+                    f"outer_k_r_hat={outer_mrac.k_r_hat:.3f}"
+
+                ),
+
+                "outer_k_x_hat": (
+
+                    f"outer_k_x_hat={outer_mrac.k_x_hat:.3f}"
+
+                ),
+
+                "outer_k_r_dot": (
+
+                    f"outer_k_r_dot={outer_mrac.k_r_dot:.4f}"
+
+                ),
+
+                "outer_k_x_dot": (
+
+                    f"outer_k_x_dot={outer_mrac.k_x_dot:.4f}"
+
+                ),
+
+                "outer_theta_norm": (
+
+                    f"outer_theta_norm={outer_mrac.theta_norm:.3f}"
+
+                ),
+
+                "outer_pwm_baseline": (
+
+                    f"outer_pwm_baseline={outer_mrac.pwm_baseline:.3f}"
+
+                ),
+
+                "outer_pwm_raw": (
+
+                    f"outer_pwm_raw={outer_mrac.pwm_adaptive_raw:.3f}"
+
+                ),
+
+                "outer_pwm_sat": (
+
+                    f"outer_pwm_sat={outer_mrac.pwm_adaptive_sat:.3f}"
+
+                ),
+
+                "outer_pwm_final": (
+
+                    f"outer_pwm_final={outer_mrac.pwm_final:.3f}"
+
+                ),
+
+                "outer_b_hat": (
+
+                    f"outer_b_hat={outer_mrac.b_hat_ms2_per_pwm:.3f}"
+
+                ),
+
+            }
+
+            for field_name in cfg.DEBUG_FIELDS:
+
+                if field_name in outer_mrac_debug_map:
+
+                    snapshot_to_print.append(
+
+                        outer_mrac_debug_map[field_name]
+
+                    )
+
 
         self.get_logger().info("[MRAC scaffold] " + ", ".join(snapshot_to_print))
 
