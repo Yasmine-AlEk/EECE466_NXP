@@ -588,7 +588,7 @@ OUTER_MRAC_MAX_APPLIED_PWM_DELTA = 0.03
 # ============================================================
 
 INNER_MRAC_ENABLE_ADAPTATION = True
-INNER_MRAC_APPLY_TO_STEERING_CMD = True
+INNER_MRAC_APPLY_TO_STEERING_CMD = False
 
 # Keep zero blend for the first validation run.
 # Later activation can start with 0.05 or 0.10.

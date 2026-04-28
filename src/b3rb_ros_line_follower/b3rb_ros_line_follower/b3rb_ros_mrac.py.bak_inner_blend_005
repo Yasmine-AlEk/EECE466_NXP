@@ -852,17 +852,16 @@ class LineFollower(Node):
         self.update_dynamic_bicycle_model(dt_s)
 
         speed_cmd_to_send = speed_cmd
-        turn_cmd_to_send = turn_cmd
-
         if (
-            getattr(cfg, "OUTER_MRAC_APPLY", False)
+            cfg.OUTER_MRAC_APPLY_TO_SPEED_CMD
             and self.latest_outer_mrac is not None
             and self.latest_outer_mrac.applied
         ):
             speed_cmd_to_send = self.latest_outer_mrac.pwm_final
 
+        turn_cmd_to_send = turn_cmd
         if (
-            getattr(cfg, "INNER_MRAC_APPLY", False)
+            cfg.INNER_MRAC_APPLY_TO_STEERING_CMD
             and self.latest_inner_mrac is not None
             and self.latest_inner_mrac.applied
         ):

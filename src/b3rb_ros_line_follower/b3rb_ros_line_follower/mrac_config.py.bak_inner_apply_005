@@ -592,7 +592,7 @@ INNER_MRAC_APPLY_TO_STEERING_CMD = True
 
 # Keep zero blend for the first validation run.
 # Later activation can start with 0.05 or 0.10.
-INNER_MRAC_BLEND = 0.05
+INNER_MRAC_BLEND = 0.02
 
 # Inner steering adaptation must still work in slower corners,
 # so this is lower than the outer longitudinal MRAC vx threshold.

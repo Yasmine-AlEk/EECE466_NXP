@@ -1,0 +1,25 @@
+[INFO] [1777384778.601494888] [line_follower]: [MRAC scaffold] speed_cmd=0.550, vx_recon=0.000, r_recon=0.000, delta_f_est_deg=1.26deg, rls_out_valid=False, rls_out_reason=low_vx, rls_phi_ready=False, rls_phi_reason=outputs_low_vx, rls_phi_norm=0.0000, rls_est_valid=False, rls_est_update=False, rls_est_reason=matrix_outputs_low_vx, rls_update_count=0, c_alpha_f_hat=8.000, c_alpha_r_hat=8.000, rls_p_trace=2.000, rls_used_ready=False, rls_used_frozen=True, rls_used_reason=not_ready_matrix_outputs_low_vx, c_alpha_f_used=8.000, c_alpha_r_used=8.000, outer_vx_m=0.337, outer_vx_ref=0.550, inner_uc=0.008, batt_gain_valid=True, batt_gain_update=False, batt_b_hat=1.077, batt_reason=low_vx, outer_mrac_valid=True, outer_mrac_adapt=True, outer_mrac_update=False, outer_mrac_applied=False, outer_mrac_reason=protect_low_vx, outer_ex=-0.337, outer_vx_m=0.337, outer_vx_ref=0.550, outer_phi_norm=0.5495, outer_k_r_hat=1.739, outer_k_x_hat=0.739, outer_k_r_dot=0.0000, outer_k_x_dot=0.0000, outer_theta_norm=1.890, outer_pwm_baseline=0.550, outer_pwm_raw=0.956, outer_pwm_sat=0.956, outer_pwm_final=0.550, outer_b_hat=1.077, inner_mrac_valid=False, inner_mrac_update=False, inner_mrac_applied=False, inner_mrac_reason=protect_low_vx, inner_phi_norm=0.0076, inner_e_vy=-0.0000, inner_e_r=-0.0067, inner_uc=0.0076, inner_theta_vy_hat=0.0000, inner_theta_r_hat=0.0000, inner_theta_uc_hat=0.3055, inner_theta_norm=0.3055, inner_delta_baseline_deg=0.82deg, inner_delta_raw_deg=0.13deg, inner_delta_sat_deg=0.13deg, inner_delta_final_deg=0.82deg, inner_turn_final=0.0274
+[INFO] [1777384779.084031035] [line_follower]: [MRAC scaffold] speed_cmd=0.550, vx_recon=0.000, r_recon=0.000, delta_f_est_deg=0.74deg, rls_out_valid=False, rls_out_reason=low_vx, rls_phi_ready=False, rls_phi_reason=outputs_low_vx, rls_phi_norm=0.0000, rls_est_valid=False, rls_est_update=False, rls_est_reason=matrix_outputs_low_vx, rls_update_count=0, c_alpha_f_hat=8.000, c_alpha_r_hat=8.000, rls_p_trace=2.000, rls_used_ready=False, rls_used_frozen=True, rls_used_reason=not_ready_matrix_outputs_low_vx, c_alpha_f_used=8.000, c_alpha_r_used=8.000, outer_vx_m=0.475, outer_vx_ref=0.550, inner_uc=0.008, batt_gain_valid=True, batt_gain_update=False, batt_b_hat=1.077, batt_reason=low_vx, outer_mrac_valid=True, outer_mrac_adapt=True, outer_mrac_update=False, outer_mrac_applied=False, outer_mrac_reason=protect_low_vx, outer_ex=-0.475, outer_vx_m=0.475, outer_vx_ref=0.550, outer_phi_norm=0.5502, outer_k_r_hat=1.739, outer_k_x_hat=0.739, outer_k_r_dot=0.0000, outer_k_x_dot=0.0000, outer_theta_norm=1.890, outer_pwm_baseline=0.550, outer_pwm_raw=0.957, outer_pwm_sat=0.957, outer_pwm_final=0.550, outer_b_hat=1.077, inner_mrac_valid=False, inner_mrac_update=False, inner_mrac_applied=False, inner_mrac_reason=protect_low_vx, inner_phi_norm=0.0076, inner_e_vy=-0.0000, inner_e_r=-0.0075, inner_uc=0.0076, inner_theta_vy_hat=0.0000, inner_theta_r_hat=0.0000, inner_theta_uc_hat=0.3055, inner_theta_norm=0.3055, inner_delta_baseline_deg=0.71deg, inner_delta_raw_deg=0.13deg, inner_delta_sat_deg=0.13deg, inner_delta_final_deg=0.71deg, inner_turn_final=0.0238
+Traceback (most recent call last):
+  File "/home/yasmine/cognipilot/cranium/install/b3rb_ros_line_follower/lib/b3rb_ros_line_follower/runner_mrac", line 33, in <module>
+    sys.exit(load_entry_point('b3rb-ros-line-follower', 'console_scripts', 'runner_mrac')())
+  File "/home/yasmine/cognipilot/cranium/build/b3rb_ros_line_follower/b3rb_ros_line_follower/b3rb_ros_mrac.py", line 1168, in main
+    rclpy.spin(line_follower)
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/__init__.py", line 229, in spin
+    executor.spin_once()
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/executors.py", line 808, in spin_once
+    self._spin_once_impl(timeout_sec)
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/executors.py", line 805, in _spin_once_impl
+    raise handler.exception()
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/task.py", line 272, in _execute_coroutine_step
+    result = coro.send(None)
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/executors.py", line 488, in handler
+    await call_coroutine(entity, arg)
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/executors.py", line 407, in _execute_subscription
+    await await_or_execute(sub.callback, msg)
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rclpy/executors.py", line 110, in await_or_execute
+    return callback(*args)
+  File "/home/yasmine/cognipilot/cranium/build/b3rb_ros_line_follower/b3rb_ros_line_follower/b3rb_ros_mrac.py", line 869, in edge_vectors_callback
+    turn_cmd_to_send = self.latest_inner_mrac.turn_final
+AttributeError: 'InnerSteeringMRACOutput' object has no attribute 'turn_final'. Did you mean: 'turn_final_cmd'?
+[ros2run]: Process exited with failure 1
