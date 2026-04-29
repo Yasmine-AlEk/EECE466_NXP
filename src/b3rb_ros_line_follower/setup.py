@@ -25,6 +25,8 @@ setup(
             'runner = b3rb_ros_line_follower.b3rb_ros_line_follower:main',
             'runner_mrac = b3rb_ros_line_follower.b3rb_ros_mrac:main',
             'detect = b3rb_ros_line_follower.b3rb_ros_object_recog:main',
+            'runner_rl = b3rb_ros_line_follower.b3rb_ros_rl:main',
+            'gz_cmd_bridge = b3rb_ros_line_follower.b3rb_ros_gz_cmd_bridge:main',
         ],
     },
 )
