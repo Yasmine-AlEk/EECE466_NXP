@@ -1,0 +1,22 @@
+digraph ROS2_MRAC_Graph {
+  rankdir=LR;
+  graph [fontsize=18, labelloc="t", label="ROS 2 Communication Graph for MRAC Line Follower"];
+  node [shape=box, style="rounded", fontsize=13];
+  edge [fontsize=11];
+
+  edge_vectors_publisher [label="/edge_vectors_publisher\nPerception / edge vectors"];
+  synapse_ros [label="/cerebri/synapse_ros\nVehicle interface"];
+  lidar [label="/scan\nLiDAR"];
+  traffic [label="/traffic_status\nTraffic status"];
+  line_follower [label="/line_follower\nMRAC runner\nOuter MRAC + Inner MRAC + RLS + Phase 7", shape=box, style="rounded,bold"];
+  vehicle_cmd [label="/cerebri/in/joy\nFinal throttle + steering command", shape=box, style="rounded,bold"];
+
+  edge_vectors_publisher -> line_follower [label="/edge_vectors"];
+  synapse_ros -> line_follower [label="/cerebri/out/odometry"];
+  synapse_ros -> line_follower [label="/cerebri/out/status"];
+  lidar -> line_follower [label="/scan"];
+  traffic -> line_follower [label="/traffic_status"];
+
+  line_follower -> vehicle_cmd [label="sensor_msgs/Joy"];
+  vehicle_cmd -> synapse_ros [label="vehicle command"];
+}

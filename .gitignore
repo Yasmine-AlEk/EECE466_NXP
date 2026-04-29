@@ -13,3 +13,20 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# ROS / colcon generated files
+
+# Runtime logs and MRAC plots
+logs/
+*.log
+
+# Local backup files from patching
+*.bak*
+*.backup*
+*backup*
+local_backups/
+
+# Python cache
+
+# Runtime logs and generated plots
+

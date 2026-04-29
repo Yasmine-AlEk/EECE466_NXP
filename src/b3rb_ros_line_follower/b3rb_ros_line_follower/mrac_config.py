@@ -821,3 +821,40 @@ for _field in [
     if _field not in DEBUG_FIELDS:
         DEBUG_FIELDS.append(_field)
 
+# === TASK 6.2D INNER MRAC SAFER TUNING OVERRIDE ===
+# This block intentionally overrides the earlier aggressive full-MRAC values.
+# It keeps MRAC-only steering active, but reduces the initial feedforward gain
+# and caps the steering authority to avoid the ±20 deg spikes seen in logs.
+#
+# Previous issue:
+#   INNER_MRAC_NOMINAL_VX_MS = 0.05
+#   theta_uc_initial = L / 0.05, then clamped near theta_max = 2.0
+# This made delta ≈ 2.0 * inner_uc, which produced ~20+ deg steering spikes.
+#
+# New trial:
+#   use a realistic tight-turn scheduled speed for initial feedforward.
+INNER_MRAC_NOMINAL_VX_MS = 0.25
+INNER_MRAC_THETA_UC_INITIAL = (
+    KINEMATIC_WHEELBASE_M / max(INNER_MRAC_NOMINAL_VX_MS, 1.0e-6)
+)
+
+# Keep the adaptive steering law active, but prevent excessive gain growth.
+INNER_MRAC_THETA_MIN = -1.20
+INNER_MRAC_THETA_MAX = +1.20
+INNER_MRAC_MAX_ABS_THETA_DOT = 0.04
+
+# Keep MRAC-only behavior. This is not PID fallback.
+INNER_MRAC_APPLY = True
+INNER_MRAC_APPLY_TO_STEERING_CMD = True
+INNER_MRAC_BLEND = 1.0
+
+# Practical steering cap for this tuning run.
+# Baseline peaked around +10 deg, while MRAC was reaching about ±22 deg.
+# Start with 16 deg so the controller still has more authority than baseline,
+# but not enough to create violent steering spikes.
+INNER_MRAC_MAX_DELTA_RAD = math.radians(16.0)
+INNER_MRAC_MAX_APPLIED_DELTA_RAD = math.radians(16.0)
+
+# Keep disagreement non-fallback behavior because this is the MRAC-only test.
+INNER_MRAC_MAX_DELTA_DISAGREEMENT_RAD = 999.0
+# === END TASK 6.2D INNER MRAC SAFER TUNING OVERRIDE ===

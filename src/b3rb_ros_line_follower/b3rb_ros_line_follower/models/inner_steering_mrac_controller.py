@@ -102,6 +102,9 @@ class InnerSteeringMRACController:
         reference_a_r_s_inv: float = 4.0,
         b_delta_vy: float = 2.6666666667,
         b_delta_r: float = 13.44,
+        applied_delta_rate_limit_rad_s: float = 1.20,
+        applied_delta_filter_alpha: float = 0.35,
+        freeze_adaptation_on_delta_saturation: bool = True,
     ):
         self.theta_vy_initial = float(theta_vy_initial)
         self.theta_r_initial = float(theta_r_initial)
@@ -162,6 +165,25 @@ class InnerSteeringMRACController:
 
         self.b_delta_vy = float(b_delta_vy)
         self.b_delta_r = float(b_delta_r)
+
+        # MRAC-only output conditioning.
+        # This is not PID fallback. It only makes the adaptive steering command
+        # physically smoother before sending it to /cerebri/in/joy.
+        self.applied_delta_rate_limit_rad_s = max(
+            0.0,
+            float(applied_delta_rate_limit_rad_s),
+        )
+        self.applied_delta_filter_alpha = self._clamp(
+            float(applied_delta_filter_alpha),
+            0.0,
+            1.0,
+        )
+        self.freeze_adaptation_on_delta_saturation = bool(
+            freeze_adaptation_on_delta_saturation
+        )
+        self._delta_final_prev_rad = 0.0
+        self._delta_final_filter_initialized = False
+        self._last_delta_saturated = False
 
     @staticmethod
     def _clamp(value: float, lower: float, upper: float) -> float:
@@ -269,6 +291,48 @@ class InnerSteeringMRACController:
             turn_sat_cmd=self._delta_to_turn_cmd(delta_sat_rad),
             turn_final_cmd=self._delta_to_turn_cmd(delta_final_rad),
         )
+
+    def _smooth_and_rate_limit_delta(
+        self,
+        target_delta_rad: float,
+        dt_s: float,
+    ) -> float:
+        target_delta_rad = self._clamp(
+            float(target_delta_rad),
+            -self.max_applied_delta_rad,
+            self.max_applied_delta_rad,
+        )
+
+        if (not self._delta_final_filter_initialized) or dt_s <= 0.0:
+            self._delta_final_prev_rad = target_delta_rad
+            self._delta_final_filter_initialized = True
+            return target_delta_rad
+
+        alpha = self.applied_delta_filter_alpha
+        filtered_delta_rad = (
+            (1.0 - alpha) * self._delta_final_prev_rad
+            + alpha * target_delta_rad
+        )
+
+        if self.applied_delta_rate_limit_rad_s > 0.0:
+            max_step_rad = self.applied_delta_rate_limit_rad_s * dt_s
+            step_rad = self._clamp(
+                filtered_delta_rad - self._delta_final_prev_rad,
+                -max_step_rad,
+                max_step_rad,
+            )
+            limited_delta_rad = self._delta_final_prev_rad + step_rad
+        else:
+            limited_delta_rad = filtered_delta_rad
+
+        limited_delta_rad = self._clamp(
+            limited_delta_rad,
+            -self.max_applied_delta_rad,
+            self.max_applied_delta_rad,
+        )
+
+        self._delta_final_prev_rad = limited_delta_rad
+        return limited_delta_rad
 
     def update(
         self,
@@ -447,7 +511,17 @@ class InnerSteeringMRACController:
         elif reason != "ok":
             reason = "forced_mrac_only_" + reason
 
-        delta_final_rad = delta_sat_rad
+        delta_target_rad = self._clamp(
+            delta_sat_rad,
+            -self.max_applied_delta_rad,
+            self.max_applied_delta_rad,
+        )
+        delta_final_rad = self._smooth_and_rate_limit_delta(delta_target_rad, dt_s)
+
+        self._last_delta_saturated = (
+            abs(delta_sat_rad - delta_raw_rad) > 1.0e-9
+            or abs(delta_final_rad - delta_target_rad) > 1.0e-9
+        )
 
         return self._make_output(
             valid=valid,

@@ -92,6 +92,8 @@ class LineFollower(Node):
         self._inner_mrac_last_valid_uc_time = None
         self._inner_mrac_hold_last_uc_timeout_s = 1.25
         self._inner_mrac_hold_last_uc_min_abs = 0.002
+        self._inner_mrac_uc_filtered = 0.0
+        self._inner_mrac_uc_filter_initialized = False
 
         self.subscription_vectors = self.create_subscription(
             EdgeVectors,
@@ -483,6 +485,89 @@ class LineFollower(Node):
         self.a_long_cmd_est = 0.0
 
         self.last_speed_cmd = 0.0
+
+    def condition_inner_reference_command_for_mrac(self, reference_command, now_s: float):
+        """Condition inner yaw-rate command before MRAC steering.
+
+        This is not PID fallback. It only smooths/holds the MRAC reference
+        command u_c so the adaptive steering law does not receive sudden
+        zero/invalid yaw commands at turn entry/exit.
+        """
+        if not getattr(cfg, "INNER_REF_HOLD_ENABLE", True):
+            return reference_command
+
+        class ConditionedInnerReferenceCommand:
+            pass
+
+        out = ConditionedInnerReferenceCommand()
+
+        uc_raw = 0.0
+        command_valid = False
+
+        if reference_command is not None:
+            uc_raw = float(getattr(reference_command, "uc_rad_s", 0.0))
+            command_valid = bool(
+                getattr(
+                    reference_command,
+                    "valid",
+                    getattr(reference_command, "command_valid", False),
+                )
+            )
+
+        max_abs_uc = float(getattr(cfg, "INNER_REF_UC_MAX_ABS_RAD_S", 0.24))
+        uc_raw = self.clamp(uc_raw, -max_abs_uc, max_abs_uc)
+
+        hold_min_abs = float(getattr(cfg, "INNER_REF_HOLD_MIN_ABS_UC_RAD_S", 0.025))
+        hold_timeout_s = float(getattr(cfg, "INNER_REF_HOLD_TIMEOUT_S", 0.90))
+
+        if command_valid and abs(uc_raw) >= hold_min_abs:
+            self._inner_mrac_last_valid_uc = uc_raw
+            self._inner_mrac_last_valid_uc_time = float(now_s)
+            uc_conditioned = uc_raw
+            conditioned_valid = True
+        else:
+            age_s = None
+            if self._inner_mrac_last_valid_uc_time is not None:
+                age_s = float(now_s) - float(self._inner_mrac_last_valid_uc_time)
+
+            if (
+                age_s is not None
+                and age_s <= hold_timeout_s
+                and abs(self._inner_mrac_last_valid_uc) >= hold_min_abs
+            ):
+                uc_conditioned = self._inner_mrac_last_valid_uc
+                conditioned_valid = True
+            else:
+                uc_conditioned = uc_raw if command_valid else 0.0
+                conditioned_valid = command_valid
+
+        alpha = float(getattr(cfg, "INNER_REF_UC_FILTER_ALPHA", 0.45))
+        alpha = self.clamp(alpha, 0.0, 1.0)
+
+        if not self._inner_mrac_uc_filter_initialized:
+            self._inner_mrac_uc_filtered = uc_conditioned
+            self._inner_mrac_uc_filter_initialized = True
+        else:
+            self._inner_mrac_uc_filtered = (
+                (1.0 - alpha) * self._inner_mrac_uc_filtered
+                + alpha * uc_conditioned
+            )
+
+        uc_filtered = self.clamp(
+            self._inner_mrac_uc_filtered,
+            -max_abs_uc,
+            max_abs_uc,
+        )
+
+        out.uc_rad_s = uc_filtered
+        out.u_c_rad_s = uc_filtered
+        out.uc = uc_filtered
+        out.valid = conditioned_valid
+        out.command_valid = conditioned_valid
+        out.raw_uc_rad_s = uc_raw
+        out.held_uc_rad_s = self._inner_mrac_last_valid_uc
+
+        return out
 
     def rover_move_manual_mode(self, speed_cmd, turn_cmd):
         """Operates the rover in manual mode by publishing on /cerebri/in/joy."""
