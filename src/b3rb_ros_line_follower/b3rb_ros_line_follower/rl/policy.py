@@ -7,9 +7,12 @@ class GaussianPolicy(nn.Module):
     """
     Stochastic Gaussian policy for REINFORCE.
 
-    Architecture: Linear(state_dim, hidden) -> Tanh -> Linear(hidden, 1) -> Tanh
-    The Tanh output is scaled by delta_max so the mean always lives in
-    (-delta_max, +delta_max).  Log-std is a single learnable scalar.
+    Architecture: Linear(state_dim, hidden) -> Tanh -> Linear(hidden, hidden) -> Tanh
+                  -> Linear(hidden, 1) -> Tanh -> scaled by delta_max
+
+    Two hidden layers give the policy enough capacity to learn velocity-
+    dependent steering corrections without over-fitting on a shallow track.
+    Log-std is a learnable scalar, initialised to -1 (std ≈ 0.37).
 
     Usage
     -----
@@ -20,7 +23,7 @@ class GaussianPolicy(nn.Module):
     def __init__(
         self,
         state_dim:  int   = 4,
-        hidden_dim: int   = 16,
+        hidden_dim: int   = 32,
         delta_max:  float = 0.30,
         device: str = "cpu",
     ) -> None:
@@ -31,13 +34,21 @@ class GaussianPolicy(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1),
             nn.Tanh(),
         )
-        # Initialise log_std = -1  →  std ≈ 0.37 rad: moderate early exploration
+        # log_std = -1 → std ≈ 0.37 at the start; will be learned
         self.log_std = nn.Parameter(torch.tensor(-1.0))
 
-        # Move all neural-network parameters to the selected device.
+        # Initialise weights with small values so the policy starts near
+        # zero residual (letting MRAC do the work at the beginning).
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.1)
+                nn.init.zeros_(m.bias)
+
         self.to(self.device)
 
     # ------------------------------------------------------------------ #
@@ -56,9 +67,9 @@ class GaussianPolicy(nn.Module):
         """
         s    = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
         mean = self._mean(s)
-        std  = self.log_std.exp().clamp(min=1e-4)
+        std  = self.log_std.exp().clamp(min=1e-4, max=1.0)
         dist = torch.distributions.Normal(mean, std)
-        raw  = dist.rsample()                                     # reparameterised
+        raw  = dist.rsample()
         log_prob = dist.log_prob(raw).squeeze()
         action   = float(raw.clamp(-self.delta_max, self.delta_max).item())
         return action, log_prob
@@ -69,6 +80,10 @@ class GaussianPolicy(nn.Module):
             s = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
             return float(self._mean(s).item())
 
+    def entropy(self) -> torch.Tensor:
+        """Gaussian entropy — used as a training regulariser."""
+        return self.log_std + 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi)))
+
     # ------------------------------------------------------------------ #
 
     def save(self, path: str) -> None:
@@ -78,7 +93,6 @@ class GaussianPolicy(nn.Module):
         try:
             sd = torch.load(path, map_location=self.device, weights_only=True)
         except TypeError:
-            # PyTorch < 2.0 does not have weights_only
             sd = torch.load(path, map_location=self.device)
         self.load_state_dict(sd)
         self.to(self.device)

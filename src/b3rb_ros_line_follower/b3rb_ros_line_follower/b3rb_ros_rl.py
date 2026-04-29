@@ -5,42 +5,37 @@ Architecture
 ------------
 Baseline PID  →  MRAC inner steering  →  +δ_rl (RL residual)  →  /nxp_cup/cmd_safe
 
-The baseline PID is still executed every step because the MRAC adaptive law
-requires the PID turn command as 'baseline_turn_cmd' input.  The RL residual
-corrects the MRAC output, not the raw PID output.
-
 Modes
 -----
 training=true  (Gazebo only)
-    Runs episodic REINFORCE training.  At the end of each episode the policy
-    gradient is applied, weights are saved to disk, and the robot is teleported
-    back to its spawn pose via the gz service CLI.
+    Runs episodic REINFORCE training.
 
 training=false  (Gazebo + hardware)
-    Loads saved weights and runs the policy in deterministic inference mode.
-    No trajectory collection, no gradient updates, no Gazebo reset calls.
+    Deterministic inference mode.
 
-Topics
+Topics  (mirrors runner_mrac — no bridge nodes required)
 ------
-  Sub  /nxp_cup/lane_chains  (std_msgs/String)     — vision pipeline JSON
-  Sub  /nxp_cup/wheel_odom   (nav_msgs/Odometry)   — remap to /cerebri/out/odometry in Gazebo
-  Sub  /traffic_status       (synapse_msgs/TrafficStatus)
-  Pub  /nxp_cup/cmd_safe     (geometry_msgs/TwistStamped)
+  Sub  /edge_vectors          (synapse_msgs/EdgeVectors)   — vision pipeline (FIXED)
+  Sub  /cerebri/out/odometry  (nav_msgs/Odometry)          — vehicle state   (FIXED)
+  Sub  /traffic_status        (synapse_msgs/TrafficStatus)
+  Pub  /nxp_cup/cmd_safe      (geometry_msgs/TwistStamped)
 
 Parameters
 ----------
-  training       bool    True    — training vs deployment mode
-  delta_max      float   0.30    — maximum RL steering correction (fraction of [-1,1] range)
-  gamma          float   0.99    — discount factor
-  lr             float   1e-3    — Adam learning rate
-  no_lane_limit  int     20      — consecutive no-measurement frames to declare episode done
-  max_steps      int     2000    — hard step cap per episode (fallback termination)
-  settle_steps   int     30      — frames to hold zero after reset before collecting
-  world_name     str   "default" — gz world name for the set_pose service
-  weights_path   str  "~/rl_policy.pt"
-  spawn_x/y/z    float           — robot spawn pose used by gz reset
+  training       bool    True
+  delta_max      float   0.30
+  gamma          float   0.99
+  lr             float   1e-3
+  no_lane_limit  int     20
+  max_steps      int     4000
+  settle_steps   int     30
+  world_name     str     "default"
+  weights_path   str     "~/rl_policy.pt"
+  spawn_x/y/z    float
+  spawn_yaw      float   0.0  — radians, converted to quaternion for gz set_pose
 """
 
+import math
 import os
 import subprocess
 from enum import Enum, auto
@@ -50,8 +45,7 @@ import rclpy
 from geometry_msgs.msg import TwistStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import String
-from synapse_msgs.msg import TrafficStatus
+from synapse_msgs.msg import EdgeVectors, TrafficStatus
 
 from . import mrac_config as cfg
 from .controllers.baseline_lane_controller import BaselineLaneController
@@ -62,19 +56,13 @@ from .models.inner_reference_command import InnerReferenceCommandModel
 from .models.inner_steering_mrac_controller import InnerSteeringMRACController
 from .models.speed_scheduler import FilteredSpeedScheduler
 from .mrac_utils import turn_cmd_to_delta_f_est
-from .perception.path_measurements import PathMeasurementExtractor
+from .perception.camera_measurements import CameraMeasurementExtractor   # FIX: use same extractor as MRAC
 from .rl.episode_manager import REINFORCETrainer
 from .rl.policy import GaussianPolicy
 
 QOS_PROFILE_DEFAULT = 10
 
-# ---------------------------------------------------------------------- #
-# State normalisation                                                      #
-#   ye_cam_filt      ∈ [-1,  1]       (already normalised by BEV width)  #
-#   psi_rel_cam_filt ∈ [-1,  1]       (already normalised by BEV width)  #
-#   vx_recon         ∈ [ 0, ~0.6] m/s  →  ×2 brings it to [0, ~1.2]    #
-#   a_long_filt      ∈ [-2,  2]  m/s²  →  ×0.5 brings it to [-1, 1]    #
-# ---------------------------------------------------------------------- #
+# State scaling: ye, psi_rel already in [-1,1]; vx*2 and ax*0.5 normalise to ~[-1,1]
 _S_SCALE = np.array([1.0, 1.0, 2.0, 0.5], dtype=np.float32)
 
 
@@ -84,7 +72,6 @@ class _EpState(Enum):
 
 
 def _make_mrac_components():
-    """Instantiate the MRAC inner steering chain from mrac_config constants."""
     speed_scheduler = FilteredSpeedScheduler(
         tau_s=cfg.INNER_SPEED_SCHEDULER_TAU_S,
         min_valid_vx_ms=cfg.INNER_LATERAL_YAW_MIN_VX_MS,
@@ -146,10 +133,8 @@ def _make_mrac_components():
                                      cfg.INNER_REFERENCE_MODEL_A_VY_S_INV),
         reference_a_r_s_inv=getattr(cfg, "INNER_MRAC_P_A_R_S_INV",
                                     cfg.INNER_REFERENCE_MODEL_A_R_S_INV),
-        b_delta_vy=(cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD
-                    / cfg.DYNAMIC_BICYCLE_MASS_KG),
-        b_delta_r=(cfg.DYNAMIC_BICYCLE_LF_M
-                   * cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD
+        b_delta_vy=(cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD / cfg.DYNAMIC_BICYCLE_MASS_KG),
+        b_delta_r=(cfg.DYNAMIC_BICYCLE_LF_M * cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD
                    / cfg.DYNAMIC_BICYCLE_IZ_KG_M2),
     )
     return speed_scheduler, lat_yaw_model, ref_cmd_model, lat_yaw_ref_model, steering_mrac
@@ -160,7 +145,6 @@ class RLRunner(Node):
     def __init__(self) -> None:
         super().__init__("rl_runner")
 
-        # ---- declare & read parameters -------------------------------- #
         self.declare_parameter("training",      True)
         self.declare_parameter("delta_max",     0.30)
         self.declare_parameter("gamma",         0.99)
@@ -173,28 +157,40 @@ class RLRunner(Node):
         self.declare_parameter("spawn_x",       -5.0)
         self.declare_parameter("spawn_y",       -2.0)
         self.declare_parameter("spawn_z",        0.05)
+        self.declare_parameter("spawn_yaw",      0.0)
 
-        self._training        = self.get_parameter("training").value
-        delta_max             = float(self.get_parameter("delta_max").value)
-        gamma                 = float(self.get_parameter("gamma").value)
-        lr                    = float(self.get_parameter("lr").value)
-        self._no_lane_limit   = int(self.get_parameter("no_lane_limit").value)
-        self._max_steps       = int(self.get_parameter("max_steps").value)
-        self._settle_steps    = int(self.get_parameter("settle_steps").value)
-        self._world_name      = str(self.get_parameter("world_name").value)
-        self._weights_path    = os.path.expanduser(
-            str(self.get_parameter("weights_path").value)
-        )
-        self._spawn_x = float(self.get_parameter("spawn_x").value)
-        self._spawn_y = float(self.get_parameter("spawn_y").value)
-        self._spawn_z = float(self.get_parameter("spawn_z").value)
+        self._training      = self.get_parameter("training").value
+        delta_max           = float(self.get_parameter("delta_max").value)
+        gamma               = float(self.get_parameter("gamma").value)
+        lr                  = float(self.get_parameter("lr").value)
+        self._no_lane_limit = int(self.get_parameter("no_lane_limit").value)
+        self._max_steps     = int(self.get_parameter("max_steps").value)
+        self._settle_steps  = int(self.get_parameter("settle_steps").value)
+        self._world_name    = str(self.get_parameter("world_name").value)
+        self._weights_path  = os.path.expanduser(
+            str(self.get_parameter("weights_path").value))
+        self._spawn_x   = float(self.get_parameter("spawn_x").value)
+        self._spawn_y   = float(self.get_parameter("spawn_y").value)
+        self._spawn_z   = float(self.get_parameter("spawn_z").value)
+        self._spawn_yaw = float(self.get_parameter("spawn_yaw").value)
 
-        # ---- subscriptions & publisher -------------------------------- #
+        # ------------------------------------------------------------------ #
+        # FIX 1: subscribe to /edge_vectors directly (same as runner_mrac).
+        #         The old /nxp_cup/lane_chains subscription required the
+        #         lane_bridge node to be running; if it wasn't, camera.have_measurement
+        #         was always False and the car had no steering at all.
+        # ------------------------------------------------------------------ #
         self.create_subscription(
-            String, "/nxp_cup/lane_chains", self._lane_chains_cb, QOS_PROFILE_DEFAULT
+            EdgeVectors, "/edge_vectors", self._edge_vectors_cb, QOS_PROFILE_DEFAULT
         )
+        # ------------------------------------------------------------------ #
+        # FIX 2: subscribe to /cerebri/out/odometry (same as runner_mrac).
+        #         The old /nxp_cup/wheel_odom topic is not published by Gazebo,
+        #         so vehicle.odom_ready was always False → vx always 0 →
+        #         MRAC never activated → car went straight off every turn.
+        # ------------------------------------------------------------------ #
         self.create_subscription(
-            Odometry, "/nxp_cup/wheel_odom", self._odom_cb, QOS_PROFILE_DEFAULT
+            Odometry, "/cerebri/out/odometry", self._odom_cb, QOS_PROFILE_DEFAULT
         )
         self.create_subscription(
             TrafficStatus, "/traffic_status", self._traffic_cb, QOS_PROFILE_DEFAULT
@@ -203,9 +199,10 @@ class RLRunner(Node):
             TwistStamped, "/nxp_cup/cmd_safe", QOS_PROFILE_DEFAULT
         )
 
-        # ---- per-episode stateful components -------------------------- #
-        # All replaced wholesale on each episode reset — no reset() methods needed.
-        self._extractor = PathMeasurementExtractor()
+        self._half_width: float = 200.0   # updated from first EdgeVectors message
+
+        # Per-episode components — replaced wholesale on reset
+        self._extractor = CameraMeasurementExtractor()   # FIX 3: use CameraMeasurementExtractor
         self._baseline  = BaselineLaneController()
         self._estimator = VehicleStateEstimator()
         self._traffic   = TrafficStatus()
@@ -217,8 +214,8 @@ class RLRunner(Node):
             self._steering_mrac,
         ) = _make_mrac_components()
 
-        # ---- policy --------------------------------------------------- #
-        self._policy = GaussianPolicy(state_dim=4, hidden_dim=16, delta_max=delta_max)
+        # Policy — hidden_dim 32 gives enough capacity without overfitting
+        self._policy = GaussianPolicy(state_dim=4, hidden_dim=32, delta_max=delta_max)
 
         if self._training:
             self._trainer: REINFORCETrainer | None = REINFORCETrainer(
@@ -235,7 +232,6 @@ class RLRunner(Node):
                 f"[RL] no weights at {self._weights_path} — policy is uninitialised"
             )
 
-        # ---- episode bookkeeping -------------------------------------- #
         self._ep_state    = _EpState.COLLECTING
         self._no_lane_cnt = 0
         self._step_cnt    = 0
@@ -257,30 +253,30 @@ class RLRunner(Node):
     def _traffic_cb(self, msg: TrafficStatus) -> None:
         self._traffic = msg
 
-    def _lane_chains_cb(self, msg: String) -> None:
-        camera  = self._extractor.extract_from_json(msg.data)
+    def _edge_vectors_cb(self, msg: EdgeVectors) -> None:
+        # Mirror runner_mrac: derive half_width from message header
+        if msg.image_width > 0:
+            self._half_width = float(msg.image_width) / 2.0
+
+        camera  = self._extractor.extract(msg, self._half_width)
         vehicle = self._estimator.vehicle
 
-        # ---- SETTLING: hold zero, wait for simulator state to stabilise ---- #
+        # ---- SETTLING phase ---- #
         if self._ep_state == _EpState.SETTLING:
             self._publish(0.0, 0.0)
             self._settle_cnt += 1
             if self._settle_cnt >= self._settle_steps:
                 self._ep_state   = _EpState.COLLECTING
                 self._settle_cnt = 0
-                self.get_logger().info(
-                    f"[RL] episode {self._episode_num} started"
-                )
+                self.get_logger().info(f"[RL] episode {self._episode_num} started")
             return
 
-        # ---- COLLECTING ---------------------------------------------------- #
+        # ---- COLLECTING phase ---- #
         vx = float(vehicle.vx_recon)    if vehicle.odom_ready else 0.0
         ax = float(vehicle.a_long_filt) if vehicle.odom_ready else 0.0
 
         state = _build_state(camera, vx, ax)
 
-        # 1. Baseline PID — provides speed and the turn input the MRAC
-        #    adaptive law needs as baseline_turn_cmd.
         stop = bool(getattr(self._traffic, "stop_sign", False))
         turn_wp, speed_wp, dt_s = self._baseline.compute(
             camera=camera,
@@ -289,10 +285,8 @@ class RLRunner(Node):
             ramp_detected=False,
         )
 
-        # 2. MRAC inner steering on top of baseline.
         mrac_turn = self._compute_mrac_turn(camera, vehicle, turn_wp, dt_s)
 
-        # 3. RL residual correction on top of MRAC.
         if self._training:
             delta_rl, log_prob = self._policy.sample(state)
         else:
@@ -302,42 +296,26 @@ class RLRunner(Node):
         turn_cmd = float(np.clip(mrac_turn + delta_rl, -1.0, 1.0))
         self._publish(speed_wp, turn_cmd)
 
-        # ---- training bookkeeping -------------------------------------- #
         if self._training:
             done, terminal_r = self._check_done(camera)
             reward = terminal_r if done else _reward(camera, vx, delta_rl)
             self._trainer.store(log_prob, reward)   # type: ignore[arg-type]
             self._step_cnt += 1
-
             if done:
                 self._end_episode()
 
     # ------------------------------------------------------------------ #
-    # MRAC inner steering                                                  #
+    # MRAC inner steering chain                                            #
     # ------------------------------------------------------------------ #
 
     def _compute_mrac_turn(
         self, camera, vehicle, baseline_turn: float, dt_s: float
     ) -> float:
-        """
-        Run the MRAC inner steering chain and return the final turn command.
-
-        Chain:
-            FilteredSpeedScheduler
-            → InnerLateralYawReducedModel    (lateral/yaw plant)
-            → InnerReferenceCommandModel     (desired yaw rate from camera error)
-            → InnerLateralYawReferenceModel  (reference model dynamics)
-            → InnerSteeringMRACController    (adaptive law → turn_sat_cmd)
-
-        Falls back to baseline_turn if MRAC has not yet activated (e.g. speed
-        below min_vx_ms or first frame before odometry is ready).
-        """
         vx = float(vehicle.vx_recon) if vehicle.odom_ready else 0.0
         vy = float(vehicle.vy_recon) if vehicle.odom_ready else 0.0
         r  = float(vehicle.r_recon)  if vehicle.odom_ready else 0.0
 
         baseline_delta_rad = turn_cmd_to_delta_f_est(baseline_turn)
-
         speed_sched = self._speed_scheduler.update(raw_vx_ms=vx, dt_s=dt_s)
 
         lat_yaw = self._lat_yaw_model.build(
@@ -345,7 +323,7 @@ class RLRunner(Node):
             r_rad_s=r,
             vx0_ms=speed_sched.vx0_ms,
             delta_f_rad=baseline_delta_rad,
-            dfx_n=0.0,          # no torque vectoring in the RL runner
+            dfx_n=0.0,
         )
 
         ref_cmd = self._ref_cmd_model.build(
@@ -384,17 +362,16 @@ class RLRunner(Node):
     # ------------------------------------------------------------------ #
 
     def _check_done(self, camera) -> tuple:
-        """Returns (done: bool, terminal_reward: float)."""
         if not camera.have_measurement:
             self._no_lane_cnt += 1
         else:
             self._no_lane_cnt = 0
 
         if self._no_lane_cnt >= self._no_lane_limit:
-            return True, -1.0          # track departure penalty
+            return True, -10.0    # FIX 4: larger terminal penalty (was -1.0)
 
         if self._step_cnt >= self._max_steps:
-            return True, +1.0          # survived max steps — small bonus
+            return True, +2.0     # completion bonus
 
         return False, 0.0
 
@@ -409,8 +386,7 @@ class RLRunner(Node):
         self._reset_episode()
 
     def _reset_episode(self) -> None:
-        """Flush all episode-local state and re-enter SETTLING."""
-        self._extractor = PathMeasurementExtractor()
+        self._extractor = CameraMeasurementExtractor()
         self._baseline  = BaselineLaneController()
         self._estimator = VehicleStateEstimator()
         (
@@ -431,22 +407,18 @@ class RLRunner(Node):
 
     def _gz_reset(self) -> None:
         """
-        Teleport the robot to spawn pose using the gz service CLI.
-
-        The set_pose service is exposed by gz-sim 8 (Harmonic) at:
-            /world/{world_name}/set_pose
-        with request type gz.msgs.Pose and reply type gz.msgs.Boolean.
-
-        Run  `gz service --list`  inside the simulation to confirm the exact
-        service name if the world name differs from 'default'.
-
-        The call is non-blocking (Popen) — the SETTLING phase gives >3 s of
-        buffer time for the service to complete before data collection resumes.
+        Teleport the robot to spawn pose.
+        spawn_yaw (radians) is converted to a quaternion so the robot faces
+        the correct direction at episode start.
         """
+        half_yaw = self._spawn_yaw / 2.0
+        qz = math.sin(half_yaw)
+        qw = math.cos(half_yaw)
+
         req = (
             f'name: "b3rb" '
             f'position {{ x: {self._spawn_x} y: {self._spawn_y} z: {self._spawn_z} }} '
-            f'orientation {{ x: 0.0 y: 0.0 z: 0.0 w: 1.0 }}'
+            f'orientation {{ x: 0.0 y: 0.0 z: {qz:.6f} w: {qw:.6f} }}'
         )
         cmd = [
             "gz", "service",
@@ -463,10 +435,6 @@ class RLRunner(Node):
                 '[RL] "gz" binary not found — episode reset will not teleport the robot'
             )
 
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
-
     def _publish(self, speed: float, turn: float) -> None:
         msg = TwistStamped()
         msg.twist.linear.x  = float(speed)
@@ -475,11 +443,10 @@ class RLRunner(Node):
 
 
 # ---------------------------------------------------------------------- #
-# Module-level pure functions (no self needed)                            #
+# Module-level pure functions                                              #
 # ---------------------------------------------------------------------- #
 
 def _get_first_float(obj, names: list, default: float = 0.0) -> float:
-    """Return the first matching attribute from obj, or default."""
     if obj is None:
         return float(default)
     for name in names:
@@ -489,7 +456,6 @@ def _get_first_float(obj, names: list, default: float = 0.0) -> float:
 
 
 def _build_state(camera, vx: float, ax: float) -> np.ndarray:
-    """Pack the 4-dim RL state vector and normalise to ~[-1, 1]."""
     ye      = camera.ye_cam_filt      if camera.have_measurement else 0.0
     psi_rel = camera.psi_rel_cam_filt if camera.have_measurement else 0.0
     return np.array([ye, psi_rel, vx, ax], dtype=np.float32) * _S_SCALE
@@ -497,23 +463,23 @@ def _build_state(camera, vx: float, ax: float) -> np.ndarray:
 
 def _reward(camera, vx: float, delta_rl: float) -> float:
     """
-    Step reward (report eq. 66):
-        β_v · vx · cos(θ_e)  — forward progress aligned with lane direction
-      − β_e · |e_y|           — cross-track deviation penalty
-      − β_δ · |δ_rl|          — action regularisation (intervene only when needed)
+    Step reward:
+        +β_v · vx · cos(θ_e)  — forward progress aligned with lane
+        −β_e · e_y²            — quadratic lane-centering penalty
+        −β_δ · δ_rl²           — smooth action regularisation
+    Quadratic penalties (vs absolute value) give smoother, more informative
+    gradients and don't collapse to zero near the optimum.
     """
     if not camera.have_measurement:
-        return -1.0
+        return -0.5
     theta_e = camera.psi_rel_cam_filt
     e_y     = camera.ye_cam_filt
     return float(
         1.0  * vx * float(np.cos(theta_e))
-        - 0.3 * abs(e_y)
-        - 0.05 * abs(delta_rl)
+        - 0.5 * (e_y ** 2)
+        - 0.05 * (delta_rl ** 2)
     )
 
-
-# ---------------------------------------------------------------------- #
 
 def main(args=None) -> None:
     rclpy.init(args=args)
