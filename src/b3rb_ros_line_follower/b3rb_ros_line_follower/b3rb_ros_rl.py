@@ -1,5 +1,13 @@
 """
-RL runner node — REINFORCE residual steering on top of the baseline controller.
+RL runner node — REINFORCE residual steering on top of the MRAC controller.
+
+Architecture
+------------
+Baseline PID  →  MRAC inner steering  →  +δ_rl (RL residual)  →  /nxp_cup/cmd_safe
+
+The baseline PID is still executed every step because the MRAC adaptive law
+requires the PID turn command as 'baseline_turn_cmd' input.  The RL residual
+corrects the MRAC output, not the raw PID output.
 
 Modes
 -----
@@ -45,8 +53,15 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from synapse_msgs.msg import TrafficStatus
 
+from . import mrac_config as cfg
 from .controllers.baseline_lane_controller import BaselineLaneController
 from .estimation.vehicle_state_estimator import VehicleStateEstimator
+from .models.inner_lateral_yaw_reduced import InnerLateralYawReducedModel
+from .models.inner_lateral_yaw_reference import InnerLateralYawReferenceModel
+from .models.inner_reference_command import InnerReferenceCommandModel
+from .models.inner_steering_mrac_controller import InnerSteeringMRACController
+from .models.speed_scheduler import FilteredSpeedScheduler
+from .mrac_utils import turn_cmd_to_delta_f_est
 from .perception.path_measurements import PathMeasurementExtractor
 from .rl.episode_manager import REINFORCETrainer
 from .rl.policy import GaussianPolicy
@@ -66,6 +81,78 @@ _S_SCALE = np.array([1.0, 1.0, 2.0, 0.5], dtype=np.float32)
 class _EpState(Enum):
     COLLECTING = auto()
     SETTLING   = auto()
+
+
+def _make_mrac_components():
+    """Instantiate the MRAC inner steering chain from mrac_config constants."""
+    speed_scheduler = FilteredSpeedScheduler(
+        tau_s=cfg.INNER_SPEED_SCHEDULER_TAU_S,
+        min_valid_vx_ms=cfg.INNER_LATERAL_YAW_MIN_VX_MS,
+        max_dt_s=cfg.INNER_SPEED_SCHEDULER_MAX_DT_S,
+    )
+    lat_yaw_model = InnerLateralYawReducedModel(
+        mass_kg=cfg.DYNAMIC_BICYCLE_MASS_KG,
+        iz_kg_m2=cfg.DYNAMIC_BICYCLE_IZ_KG_M2,
+        lf_m=cfg.DYNAMIC_BICYCLE_LF_M,
+        lr_m=cfg.DYNAMIC_BICYCLE_LR_M,
+        rear_track_width_m=cfg.REAR_TRACK_WIDTH_M,
+        c_alpha_f_n_per_rad=cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD,
+        c_alpha_r_n_per_rad=cfg.REAR_CORNERING_STIFFNESS_N_PER_RAD,
+        min_vx_ms=cfg.INNER_LATERAL_YAW_MIN_VX_MS,
+    )
+    ref_cmd_model = InnerReferenceCommandModel(
+        kappa_from_ye_gain_1pm=cfg.INNER_REF_KAPPA_FROM_YE_GAIN_1PM,
+        kappa_from_psi_gain_1pm=cfg.INNER_REF_KAPPA_FROM_PSI_GAIN_1PM,
+        kappa_sign=cfg.INNER_REF_KAPPA_SIGN,
+        max_abs_kappa_1pm=cfg.INNER_REF_MAX_ABS_KAPPA_1PM,
+        max_abs_r_ref_rad_s=cfg.INNER_REF_MAX_ABS_R_REF_RAD_S,
+        min_vx_ms=cfg.INNER_REF_MIN_VX_MS,
+    )
+    lat_yaw_ref_model = InnerLateralYawReferenceModel(
+        a_vy_s_inv=cfg.INNER_REFERENCE_MODEL_A_VY_S_INV,
+        a_r_s_inv=cfg.INNER_REFERENCE_MODEL_A_R_S_INV,
+        max_abs_uc_rad_s=cfg.INNER_REFERENCE_MODEL_MAX_ABS_UC_RAD_S,
+        max_abs_vy_m_ms=cfg.INNER_REFERENCE_MODEL_MAX_ABS_VY_M_MS,
+        max_abs_r_m_rad_s=cfg.INNER_REFERENCE_MODEL_MAX_ABS_R_M_RAD_S,
+        max_dt_s=cfg.INNER_REFERENCE_MODEL_MAX_DT_S,
+    )
+    steering_mrac = InnerSteeringMRACController(
+        theta_vy_initial=cfg.INNER_MRAC_THETA_VY_INITIAL,
+        theta_r_initial=cfg.INNER_MRAC_THETA_R_INITIAL,
+        theta_uc_initial=cfg.INNER_MRAC_THETA_UC_INITIAL,
+        gamma_vy=cfg.INNER_MRAC_GAMMA_VY,
+        gamma_r=cfg.INNER_MRAC_GAMMA_R,
+        gamma_uc=cfg.INNER_MRAC_GAMMA_UC,
+        sigma=cfg.INNER_MRAC_SIGMA,
+        theta_min=cfg.INNER_MRAC_THETA_MIN,
+        theta_max=cfg.INNER_MRAC_THETA_MAX,
+        max_abs_theta_dot=cfg.INNER_MRAC_MAX_ABS_THETA_DOT,
+        min_vx_ms=cfg.INNER_MRAC_MIN_VX_MS,
+        min_phi_norm=cfg.INNER_MRAC_MIN_PHI_NORM,
+        max_abs_tracking_error=cfg.INNER_MRAC_MAX_ABS_TRACKING_ERROR,
+        max_dt_s=cfg.INNER_MRAC_MAX_DT_S,
+        max_delta_rad=cfg.INNER_MRAC_MAX_DELTA_RAD,
+        max_applied_delta_rad=cfg.INNER_MRAC_MAX_APPLIED_DELTA_RAD,
+        max_delta_disagreement_rad=cfg.INNER_MRAC_MAX_DELTA_DISAGREEMENT_RAD,
+        steering_rad_per_turn_cmd=cfg.STEERING_SERVO_MAX_STEER_RAD,
+        max_turn_cmd=cfg.INNER_MRAC_MAX_TURN_CMD,
+        error_vy_weight=cfg.INNER_MRAC_ERROR_VY_WEIGHT,
+        enable_adaptation=cfg.INNER_MRAC_ENABLE_ADAPTATION,
+        apply_to_steering_cmd=cfg.INNER_MRAC_APPLY_TO_STEERING_CMD,
+        blend=cfg.INNER_MRAC_BLEND,
+        lyapunov_q_vy=getattr(cfg, "INNER_MRAC_Q_VY", 1.0),
+        lyapunov_q_r=getattr(cfg, "INNER_MRAC_Q_R", 1.0),
+        reference_a_vy_s_inv=getattr(cfg, "INNER_MRAC_P_A_VY_S_INV",
+                                     cfg.INNER_REFERENCE_MODEL_A_VY_S_INV),
+        reference_a_r_s_inv=getattr(cfg, "INNER_MRAC_P_A_R_S_INV",
+                                    cfg.INNER_REFERENCE_MODEL_A_R_S_INV),
+        b_delta_vy=(cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD
+                    / cfg.DYNAMIC_BICYCLE_MASS_KG),
+        b_delta_r=(cfg.DYNAMIC_BICYCLE_LF_M
+                   * cfg.FRONT_CORNERING_STIFFNESS_N_PER_RAD
+                   / cfg.DYNAMIC_BICYCLE_IZ_KG_M2),
+    )
+    return speed_scheduler, lat_yaw_model, ref_cmd_model, lat_yaw_ref_model, steering_mrac
 
 
 class RLRunner(Node):
@@ -117,12 +204,18 @@ class RLRunner(Node):
         )
 
         # ---- per-episode stateful components -------------------------- #
-        # These are replaced wholesale on each episode reset so all filter
-        # state and integral state starts clean without needing reset methods.
+        # All replaced wholesale on each episode reset — no reset() methods needed.
         self._extractor = PathMeasurementExtractor()
         self._baseline  = BaselineLaneController()
         self._estimator = VehicleStateEstimator()
         self._traffic   = TrafficStatus()
+        (
+            self._speed_scheduler,
+            self._lat_yaw_model,
+            self._ref_cmd_model,
+            self._lat_yaw_ref_model,
+            self._steering_mrac,
+        ) = _make_mrac_components()
 
         # ---- policy --------------------------------------------------- #
         self._policy = GaussianPolicy(state_dim=4, hidden_dim=16, delta_max=delta_max)
@@ -181,28 +274,32 @@ class RLRunner(Node):
             return
 
         # ---- COLLECTING ---------------------------------------------------- #
-        vx = float(vehicle.vx_recon)   if vehicle.odom_ready else 0.0
+        vx = float(vehicle.vx_recon)    if vehicle.odom_ready else 0.0
         ax = float(vehicle.a_long_filt) if vehicle.odom_ready else 0.0
 
         state = _build_state(camera, vx, ax)
 
-        # Baseline steering + speed
+        # 1. Baseline PID — provides speed and the turn input the MRAC
+        #    adaptive law needs as baseline_turn_cmd.
         stop = bool(getattr(self._traffic, "stop_sign", False))
-        turn_wp, speed_wp, _ = self._baseline.compute(
+        turn_wp, speed_wp, dt_s = self._baseline.compute(
             camera=camera,
             stop_sign=stop,
             obstacle_detected=False,
             ramp_detected=False,
         )
 
-        # RL residual action
+        # 2. MRAC inner steering on top of baseline.
+        mrac_turn = self._compute_mrac_turn(camera, vehicle, turn_wp, dt_s)
+
+        # 3. RL residual correction on top of MRAC.
         if self._training:
             delta_rl, log_prob = self._policy.sample(state)
         else:
             delta_rl  = self._policy.act(state)
             log_prob  = None
 
-        turn_cmd = float(np.clip(turn_wp + delta_rl, -1.0, 1.0))
+        turn_cmd = float(np.clip(mrac_turn + delta_rl, -1.0, 1.0))
         self._publish(speed_wp, turn_cmd)
 
         # ---- training bookkeeping -------------------------------------- #
@@ -214,6 +311,73 @@ class RLRunner(Node):
 
             if done:
                 self._end_episode()
+
+    # ------------------------------------------------------------------ #
+    # MRAC inner steering                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _compute_mrac_turn(
+        self, camera, vehicle, baseline_turn: float, dt_s: float
+    ) -> float:
+        """
+        Run the MRAC inner steering chain and return the final turn command.
+
+        Chain:
+            FilteredSpeedScheduler
+            → InnerLateralYawReducedModel    (lateral/yaw plant)
+            → InnerReferenceCommandModel     (desired yaw rate from camera error)
+            → InnerLateralYawReferenceModel  (reference model dynamics)
+            → InnerSteeringMRACController    (adaptive law → turn_sat_cmd)
+
+        Falls back to baseline_turn if MRAC has not yet activated (e.g. speed
+        below min_vx_ms or first frame before odometry is ready).
+        """
+        vx = float(vehicle.vx_recon) if vehicle.odom_ready else 0.0
+        vy = float(vehicle.vy_recon) if vehicle.odom_ready else 0.0
+        r  = float(vehicle.r_recon)  if vehicle.odom_ready else 0.0
+
+        baseline_delta_rad = turn_cmd_to_delta_f_est(baseline_turn)
+
+        speed_sched = self._speed_scheduler.update(raw_vx_ms=vx, dt_s=dt_s)
+
+        lat_yaw = self._lat_yaw_model.build(
+            vy_ms=vy,
+            r_rad_s=r,
+            vx0_ms=speed_sched.vx0_ms,
+            delta_f_rad=baseline_delta_rad,
+            dfx_n=0.0,          # no torque vectoring in the RL runner
+        )
+
+        ref_cmd = self._ref_cmd_model.build(
+            vx0_ms=lat_yaw.vx0_safe_ms,
+            have_camera_measurement=camera.have_measurement,
+            ye_cam_filt=camera.ye_cam_filt,
+            psi_rel_cam_filt=camera.psi_rel_cam_filt,
+        )
+
+        uc    = float(getattr(ref_cmd, "uc_rad_s", 0.0)) if ref_cmd is not None else 0.0
+        valid = bool(getattr(ref_cmd,  "valid",    False)) if ref_cmd is not None else False
+
+        lat_yaw_ref = self._lat_yaw_ref_model.step(
+            uc_rad_s=uc, dt_s=dt_s, command_valid=valid
+        )
+
+        inner_mrac = self._steering_mrac.update(
+            vx_ms=vx,
+            vy_ms=vy,
+            r_rad_s=r,
+            reference_command=ref_cmd,
+            reference_model=lat_yaw_ref,
+            baseline_delta_rad=baseline_delta_rad,
+            baseline_turn_cmd=baseline_turn,
+            dt_s=dt_s,
+        )
+
+        return _get_first_float(
+            inner_mrac,
+            ["turn_sat_cmd", "turn_final_cmd", "turn_raw_cmd"],
+            default=baseline_turn,
+        )
 
     # ------------------------------------------------------------------ #
     # Episode management                                                   #
@@ -246,10 +410,16 @@ class RLRunner(Node):
 
     def _reset_episode(self) -> None:
         """Flush all episode-local state and re-enter SETTLING."""
-        # Replace stateful objects entirely — cleanest way to flush filters
-        self._extractor   = PathMeasurementExtractor()
-        self._baseline    = BaselineLaneController()
-        self._estimator   = VehicleStateEstimator()
+        self._extractor = PathMeasurementExtractor()
+        self._baseline  = BaselineLaneController()
+        self._estimator = VehicleStateEstimator()
+        (
+            self._speed_scheduler,
+            self._lat_yaw_model,
+            self._ref_cmd_model,
+            self._lat_yaw_ref_model,
+            self._steering_mrac,
+        ) = _make_mrac_components()
         self._no_lane_cnt = 0
         self._step_cnt    = 0
         self._episode_num += 1
@@ -307,6 +477,16 @@ class RLRunner(Node):
 # ---------------------------------------------------------------------- #
 # Module-level pure functions (no self needed)                            #
 # ---------------------------------------------------------------------- #
+
+def _get_first_float(obj, names: list, default: float = 0.0) -> float:
+    """Return the first matching attribute from obj, or default."""
+    if obj is None:
+        return float(default)
+    for name in names:
+        if hasattr(obj, name):
+            return float(getattr(obj, name))
+    return float(default)
+
 
 def _build_state(camera, vx: float, ax: float) -> np.ndarray:
     """Pack the 4-dim RL state vector and normalise to ~[-1, 1]."""
