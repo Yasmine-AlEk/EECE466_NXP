@@ -85,14 +85,6 @@ class LineFollower(Node):
     def __init__(self):
         super().__init__('line_follower')
 
-        # MRAC-only inner-loop hold-last command.
-        # This is NOT PID fallback. It reuses the last valid MRAC inner_uc
-        # when the reference command temporarily becomes invalid.
-        self._inner_mrac_last_valid_uc = 0.0
-        self._inner_mrac_last_valid_uc_time = None
-        self._inner_mrac_hold_last_uc_timeout_s = 1.25
-        self._inner_mrac_hold_last_uc_min_abs = 0.002
-
         self.subscription_vectors = self.create_subscription(
             EdgeVectors,
             '/edge_vectors',
@@ -1110,7 +1102,6 @@ class LineFollower(Node):
         if not self.estimator.vehicle.odom_ready:
             self.get_logger().info("[MRAC scaffold] waiting for odometry...")
             return
-
 
         if self.latest_debug_snapshot is None:
             self.get_logger().info("[MRAC scaffold] waiting for first debug snapshot...")

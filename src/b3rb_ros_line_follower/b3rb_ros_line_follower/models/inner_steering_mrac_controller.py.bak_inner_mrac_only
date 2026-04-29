@@ -432,22 +432,37 @@ class InnerSteeringMRACController:
         )
 
         delta_disagreement_rad = abs(delta_sat_rad - baseline_delta_rad)
+        can_apply = (
+            valid
+            and delta_disagreement_rad <= self.max_delta_disagreement_rad
+        )
 
-        # MRAC-only experiment:
-        # Never fall back to baseline/PID steering for the final actuator command.
-        # Invalid reference / low speed / large disagreement may still block parameter
-        # adaptation above, but the command sent to the rover is always the MRAC
-        # steering output.
-        applied = True
+        applied = bool(self.apply_to_steering_cmd and can_apply)
 
-        if not valid:
-            reason = "forced_mrac_only_" + reason
-        elif delta_disagreement_rad > self.max_delta_disagreement_rad:
-            reason = "forced_mrac_only_delta_disagreement"
-        elif reason != "ok":
-            reason = "forced_mrac_only_" + reason
+        if self.apply_to_steering_cmd and valid and not can_apply:
+            reason = "protect_delta_disagreement"
 
-        delta_final_rad = delta_sat_rad
+        if applied:
+            if self.blend >= 0.999:
+                delta_final_rad = delta_sat_rad
+            else:
+                blended_delta_rad = (
+                    baseline_delta_rad
+                    + self.blend * (delta_sat_rad - baseline_delta_rad)
+                )
+                delta_final_rad = self._clamp(
+                    blended_delta_rad,
+                    baseline_delta_rad - self.max_applied_delta_rad,
+                    baseline_delta_rad + self.max_applied_delta_rad,
+                )
+
+            delta_final_rad = self._clamp(
+                delta_final_rad,
+                -self.max_delta_rad,
+                self.max_delta_rad,
+            )
+        else:
+            delta_final_rad = baseline_delta_rad
 
         return self._make_output(
             valid=valid,

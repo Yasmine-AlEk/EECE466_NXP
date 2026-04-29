@@ -3,7 +3,7 @@ import math
 
 
 @dataclass
-class InnerSteeringMRACOutput:
+class InnerTorqueVectoringOutput:
     valid: bool
     adaptation_enabled: bool
     update_enabled: bool
@@ -31,7 +31,10 @@ class InnerSteeringMRACOutput:
     q_r: float
     p_vy: float
     p_r: float
-    s_delta: float
+
+    b_tv_vy: float
+    b_tv_r: float
+    s_tv: float
 
     theta_vy_hat: float
     theta_r_hat: float
@@ -40,35 +43,37 @@ class InnerSteeringMRACOutput:
     theta_vy_dot: float
     theta_r_dot: float
     theta_uc_dot: float
-
     theta_norm: float
 
-    delta_baseline_rad: float
-    delta_raw_rad: float
-    delta_sat_rad: float
-    delta_final_rad: float
+    dfx_raw_n: float
+    dfx_sat_n: float
+    dfx_final_n: float
+    yaw_moment_final_nm: float
 
-    turn_baseline_cmd: float
-    turn_raw_cmd: float
-    turn_sat_cmd: float
-    turn_final_cmd: float
+    c_alpha_f_used: float
+    c_alpha_r_used: float
 
 
-class InnerSteeringMRACController:
+class InnerTorqueVectoringController:
     """
-    Task 6.2 + Task 6.4 inner-loop steering MRAC.
+    Task 6.3 + Task 6.4 inner-loop torque-vectoring channel.
 
     Report law:
-        delta_f = theta_delta_hat^T phi
+        Delta_Fx = theta_TV_hat^T phi
 
     Adaptation law:
-        theta_delta_hat_dot =
-            -Gamma_delta * phi * s_delta
-            - sigma * (theta_delta_hat - theta_delta_0)
+        theta_TV_hat_dot =
+            -Gamma_TV * phi * s_TV
+            - sigma * (theta_TV_hat - theta_TV_0)
 
     where:
-        s_delta = B_delta^T P e
+        s_TV = B_TV^T P e
         A_m^T P + P A_m = -Q
+
+    Current implementation:
+        - computes Delta_Fx
+        - sends Delta_Fx to model-side wheel-force allocation
+        - does not command real independent wheels
     """
 
     def __init__(
@@ -87,21 +92,17 @@ class InnerSteeringMRACController:
         min_phi_norm: float,
         max_abs_tracking_error: float,
         max_dt_s: float,
-        max_delta_rad: float,
-        max_applied_delta_rad: float,
-        max_delta_disagreement_rad: float,
-        steering_rad_per_turn_cmd: float,
-        max_turn_cmd: float,
-        error_vy_weight: float,
+        max_abs_dfx_n: float,
+        rear_track_width_m: float,
+        iz_kg_m2: float,
+        q_vy: float,
+        q_r: float,
+        reference_a_vy_s_inv: float,
+        reference_a_r_s_inv: float,
         enable_adaptation: bool,
-        apply_to_steering_cmd: bool,
-        blend: float,
-        lyapunov_q_vy: float = 1.0,
-        lyapunov_q_r: float = 1.0,
-        reference_a_vy_s_inv: float = 3.0,
-        reference_a_r_s_inv: float = 4.0,
-        b_delta_vy: float = 2.6666666667,
-        b_delta_r: float = 13.44,
+        apply_to_model: bool,
+        nominal_c_alpha_f: float,
+        nominal_c_alpha_r: float,
     ):
         self.theta_vy_initial = float(theta_vy_initial)
         self.theta_r_initial = float(theta_r_initial)
@@ -114,7 +115,7 @@ class InnerSteeringMRACController:
         self.gamma_vy = max(0.0, float(gamma_vy))
         self.gamma_r = max(0.0, float(gamma_r))
         self.gamma_uc = max(0.0, float(gamma_uc))
-        self.Gamma_delta = [self.gamma_vy, self.gamma_r, self.gamma_uc]
+        self.Gamma_TV = [self.gamma_vy, self.gamma_r, self.gamma_uc]
 
         self.sigma = max(0.0, float(sigma))
 
@@ -127,23 +128,16 @@ class InnerSteeringMRACController:
         self.max_abs_tracking_error = abs(float(max_abs_tracking_error))
         self.max_dt_s = max(1.0e-9, float(max_dt_s))
 
-        self.max_delta_rad = abs(float(max_delta_rad))
-        self.max_applied_delta_rad = abs(float(max_applied_delta_rad))
-        self.max_delta_disagreement_rad = abs(float(max_delta_disagreement_rad))
+        self.max_abs_dfx_n = abs(float(max_abs_dfx_n))
 
-        self.steering_rad_per_turn_cmd = max(
-            abs(float(steering_rad_per_turn_cmd)),
-            1.0e-6,
-        )
-        self.max_turn_cmd = abs(float(max_turn_cmd))
+        self.rear_track_width_m = float(rear_track_width_m)
+        self.iz_kg_m2 = max(1.0e-9, float(iz_kg_m2))
 
-        self.error_vy_weight = float(error_vy_weight)
-        self.enable_adaptation = bool(enable_adaptation)
-        self.apply_to_steering_cmd = bool(apply_to_steering_cmd)
-        self.blend = max(0.0, min(1.0, float(blend)))
+        self.b_tv_vy_default = 0.0
+        self.b_tv_r_default = (0.5 * self.rear_track_width_m) / self.iz_kg_m2
 
-        self.q_vy = max(1.0e-9, float(lyapunov_q_vy))
-        self.q_r = max(1.0e-9, float(lyapunov_q_r))
+        self.q_vy = max(1.0e-9, float(q_vy))
+        self.q_r = max(1.0e-9, float(q_r))
 
         self.a_vy = max(1.0e-9, float(reference_a_vy_s_inv))
         self.a_r = max(1.0e-9, float(reference_a_r_s_inv))
@@ -151,17 +145,20 @@ class InnerSteeringMRACController:
         self.p_vy = self.q_vy / (2.0 * self.a_vy)
         self.p_r = self.q_r / (2.0 * self.a_r)
 
-        self.Q_delta = [
+        self.Q_TV = [
             [self.q_vy, 0.0],
             [0.0, self.q_r],
         ]
-        self.P_delta = [
+        self.P_TV = [
             [self.p_vy, 0.0],
             [0.0, self.p_r],
         ]
 
-        self.b_delta_vy = float(b_delta_vy)
-        self.b_delta_r = float(b_delta_r)
+        self.enable_adaptation = bool(enable_adaptation)
+        self.apply_to_model = bool(apply_to_model)
+
+        self.nominal_c_alpha_f = max(1.0e-9, float(nominal_c_alpha_f))
+        self.nominal_c_alpha_r = max(1.0e-9, float(nominal_c_alpha_r))
 
     @staticmethod
     def _clamp(value: float, lower: float, upper: float) -> float:
@@ -185,12 +182,15 @@ class InnerSteeringMRACController:
                 return bool(getattr(obj, name))
         return bool(default)
 
-    def _delta_to_turn_cmd(self, delta_rad: float) -> float:
-        return self._clamp(
-            float(delta_rad) / self.steering_rad_per_turn_cmd,
-            -self.max_turn_cmd,
-            self.max_turn_cmd,
-        )
+    @staticmethod
+    def _get_list_value(obj, name: str, index: int, default: float) -> float:
+        if obj is None or not hasattr(obj, name):
+            return float(default)
+        values = getattr(obj, name)
+        try:
+            return float(values[index])
+        except Exception:
+            return float(default)
 
     def _make_output(
         self,
@@ -212,23 +212,27 @@ class InnerSteeringMRACController:
         phi_r: float,
         phi_uc: float,
         phi_norm: float,
-        s_delta: float,
+        b_tv_vy: float,
+        b_tv_r: float,
+        s_tv: float,
         theta_vy_dot: float,
         theta_r_dot: float,
         theta_uc_dot: float,
-        delta_baseline_rad: float,
-        delta_raw_rad: float,
-        delta_sat_rad: float,
-        delta_final_rad: float,
-        turn_baseline_cmd: float,
-    ) -> InnerSteeringMRACOutput:
+        dfx_raw_n: float,
+        dfx_sat_n: float,
+        dfx_final_n: float,
+        c_alpha_f_used: float,
+        c_alpha_r_used: float,
+    ) -> InnerTorqueVectoringOutput:
         theta_norm = math.sqrt(
             self.theta_vy_hat * self.theta_vy_hat
             + self.theta_r_hat * self.theta_r_hat
             + self.theta_uc_hat * self.theta_uc_hat
         )
 
-        return InnerSteeringMRACOutput(
+        yaw_moment_final_nm = 0.5 * self.rear_track_width_m * dfx_final_n
+
+        return InnerTorqueVectoringOutput(
             valid=valid,
             adaptation_enabled=self.enable_adaptation,
             update_enabled=update_enabled,
@@ -252,7 +256,9 @@ class InnerSteeringMRACController:
             q_r=self.q_r,
             p_vy=self.p_vy,
             p_r=self.p_r,
-            s_delta=s_delta,
+            b_tv_vy=b_tv_vy,
+            b_tv_r=b_tv_r,
+            s_tv=s_tv,
             theta_vy_hat=self.theta_vy_hat,
             theta_r_hat=self.theta_r_hat,
             theta_uc_hat=self.theta_uc_hat,
@@ -260,14 +266,12 @@ class InnerSteeringMRACController:
             theta_r_dot=theta_r_dot,
             theta_uc_dot=theta_uc_dot,
             theta_norm=theta_norm,
-            delta_baseline_rad=delta_baseline_rad,
-            delta_raw_rad=delta_raw_rad,
-            delta_sat_rad=delta_sat_rad,
-            delta_final_rad=delta_final_rad,
-            turn_baseline_cmd=turn_baseline_cmd,
-            turn_raw_cmd=self._delta_to_turn_cmd(delta_raw_rad),
-            turn_sat_cmd=self._delta_to_turn_cmd(delta_sat_rad),
-            turn_final_cmd=self._delta_to_turn_cmd(delta_final_rad),
+            dfx_raw_n=dfx_raw_n,
+            dfx_sat_n=dfx_sat_n,
+            dfx_final_n=dfx_final_n,
+            yaw_moment_final_nm=yaw_moment_final_nm,
+            c_alpha_f_used=c_alpha_f_used,
+            c_alpha_r_used=c_alpha_r_used,
         )
 
     def update(
@@ -277,15 +281,15 @@ class InnerSteeringMRACController:
         r_rad_s: float,
         reference_command,
         reference_model,
-        baseline_delta_rad: float,
-        baseline_turn_cmd: float,
+        inner_lateral_yaw,
+        cornering_stiffness_used,
+        baseline_dfx_n: float,
         dt_s: float,
-    ) -> InnerSteeringMRACOutput:
+    ) -> InnerTorqueVectoringOutput:
         vx_ms = float(vx_ms)
         vy_ms = float(vy_ms)
         r_rad_s = float(r_rad_s)
-        baseline_delta_rad = float(baseline_delta_rad)
-        baseline_turn_cmd = float(baseline_turn_cmd)
+        baseline_dfx_n = float(baseline_dfx_n)
         dt_s = float(dt_s)
 
         uc_rad_s = self._get_float(
@@ -317,7 +321,7 @@ class InnerSteeringMRACController:
 
         e_vy_ms = vy_ms - vy_m_ms
         e_r_rad_s = r_rad_s - r_m_rad_s
-        e_track = e_r_rad_s + self.error_vy_weight * e_vy_ms
+        e_track = e_r_rad_s + 0.5 * e_vy_ms
 
         phi_vy = -vy_ms
         phi_r = -r_rad_s
@@ -328,11 +332,32 @@ class InnerSteeringMRACController:
             + phi_uc * phi_uc
         )
 
-        # Lyapunov scalar for the steering channel:
-        # s_delta = B_delta^T P e
-        s_delta = (
-            self.b_delta_vy * self.p_vy * e_vy_ms
-            + self.b_delta_r * self.p_r * e_r_rad_s
+        b_tv_vy = self._get_list_value(
+            inner_lateral_yaw,
+            "B_TV",
+            0,
+            self.b_tv_vy_default,
+        )
+        b_tv_r = self._get_list_value(
+            inner_lateral_yaw,
+            "B_TV",
+            1,
+            self.b_tv_r_default,
+        )
+
+        # Lyapunov scalar for the TV channel:
+        # s_TV = B_TV^T P e
+        s_tv = b_tv_vy * self.p_vy * e_vy_ms + b_tv_r * self.p_r * e_r_rad_s
+
+        c_alpha_f_used = self._get_float(
+            cornering_stiffness_used,
+            ["c_alpha_f_used", "c_alpha_f_n_per_rad", "c_alpha_f_hat"],
+            self.nominal_c_alpha_f,
+        )
+        c_alpha_r_used = self._get_float(
+            cornering_stiffness_used,
+            ["c_alpha_r_used", "c_alpha_r_n_per_rad", "c_alpha_r_hat"],
+            self.nominal_c_alpha_r,
         )
 
         valid = True
@@ -350,6 +375,9 @@ class InnerSteeringMRACController:
         elif not reference_valid:
             valid = False
             reason = "inner_reference_model_invalid"
+        elif inner_lateral_yaw is None:
+            valid = False
+            reason = "no_inner_lateral_yaw_model"
         elif dt_s <= 0.0 or dt_s > self.max_dt_s:
             valid = False
             reason = "bad_dt"
@@ -375,15 +403,15 @@ class InnerSteeringMRACController:
 
         if update_enabled:
             theta_vy_dot = (
-                -self.gamma_vy * phi_vy * s_delta
+                -self.gamma_vy * phi_vy * s_tv
                 - self.sigma * (self.theta_vy_hat - self.theta_vy_initial)
             )
             theta_r_dot = (
-                -self.gamma_r * phi_r * s_delta
+                -self.gamma_r * phi_r * s_tv
                 - self.sigma * (self.theta_r_hat - self.theta_r_initial)
             )
             theta_uc_dot = (
-                -self.gamma_uc * phi_uc * s_delta
+                -self.gamma_uc * phi_uc * s_tv
                 - self.sigma * (self.theta_uc_hat - self.theta_uc_initial)
             )
 
@@ -419,35 +447,24 @@ class InnerSteeringMRACController:
                 self.theta_max,
             )
 
-        delta_raw_rad = (
+        dfx_raw_n = (
             self.theta_vy_hat * phi_vy
             + self.theta_r_hat * phi_r
             + self.theta_uc_hat * phi_uc
         )
 
-        delta_sat_rad = self._clamp(
-            delta_raw_rad,
-            -self.max_delta_rad,
-            self.max_delta_rad,
+        dfx_sat_n = self._clamp(
+            dfx_raw_n,
+            -self.max_abs_dfx_n,
+            self.max_abs_dfx_n,
         )
 
-        delta_disagreement_rad = abs(delta_sat_rad - baseline_delta_rad)
+        applied = bool(self.apply_to_model and valid)
 
-        # MRAC-only experiment:
-        # Never fall back to baseline/PID steering for the final actuator command.
-        # Invalid reference / low speed / large disagreement may still block parameter
-        # adaptation above, but the command sent to the rover is always the MRAC
-        # steering output.
-        applied = True
-
-        if not valid:
-            reason = "forced_mrac_only_" + reason
-        elif delta_disagreement_rad > self.max_delta_disagreement_rad:
-            reason = "forced_mrac_only_delta_disagreement"
-        elif reason != "ok":
-            reason = "forced_mrac_only_" + reason
-
-        delta_final_rad = delta_sat_rad
+        if applied:
+            dfx_final_n = dfx_sat_n
+        else:
+            dfx_final_n = baseline_dfx_n
 
         return self._make_output(
             valid=valid,
@@ -468,13 +485,15 @@ class InnerSteeringMRACController:
             phi_r=phi_r,
             phi_uc=phi_uc,
             phi_norm=phi_norm,
-            s_delta=s_delta,
+            b_tv_vy=b_tv_vy,
+            b_tv_r=b_tv_r,
+            s_tv=s_tv,
             theta_vy_dot=theta_vy_dot,
             theta_r_dot=theta_r_dot,
             theta_uc_dot=theta_uc_dot,
-            delta_baseline_rad=baseline_delta_rad,
-            delta_raw_rad=delta_raw_rad,
-            delta_sat_rad=delta_sat_rad,
-            delta_final_rad=delta_final_rad,
-            turn_baseline_cmd=baseline_turn_cmd,
+            dfx_raw_n=dfx_raw_n,
+            dfx_sat_n=dfx_sat_n,
+            dfx_final_n=dfx_final_n,
+            c_alpha_f_used=c_alpha_f_used,
+            c_alpha_r_used=c_alpha_r_used,
         )

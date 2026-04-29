@@ -189,7 +189,7 @@ STATE_SPACE_K_DRAG_COEFF = 0.0
 # Task 3.2. Protects the reduced model from division by tiny vx.
 # Task 3.3 will later decide better scheduling/filtering.
 # ============================================================
-INNER_LATERAL_YAW_MIN_VX_MS = 0.05
+INNER_LATERAL_YAW_MIN_VX_MS = 0.20
 
 
 # Task 3.3 scheduling variable handling.
@@ -352,7 +352,7 @@ INNER_REF_KAPPA_SIGN = 1.0
 
 INNER_REF_MAX_ABS_KAPPA_1PM = 2.0
 INNER_REF_MAX_ABS_R_REF_RAD_S = 1.2
-INNER_REF_MIN_VX_MS = 0.05
+INNER_REF_MIN_VX_MS = 0.20
 
 DEBUG_FIELDS = [
     "speed_cmd",
@@ -423,7 +423,7 @@ MRAC_MAX_PWM_CORRECTION = 0.05
 MRAC_MAX_DELTA_FX_N = 0.30
 
 # Minimum conditions before future MRAC terms are trusted.
-MRAC_MIN_CONTROL_VX_MS = 0.05
+MRAC_MIN_CONTROL_VX_MS = 0.45
 MRAC_REQUIRE_RLS_USED_READY = True
 MRAC_FREEZE_WHEN_RLS_USED_NOT_READY = True
 # ================= End Task 6.0 MRAC safety scaffold =================
@@ -608,7 +608,7 @@ INNER_MRAC_MAX_ABS_TRACKING_ERROR = 999.0
 # Nominal steering feedforward:
 #   r ≈ vx / L * delta
 #   delta ≈ L / vx * r
-INNER_MRAC_NOMINAL_VX_MS = 0.05
+INNER_MRAC_NOMINAL_VX_MS = 0.55
 INNER_MRAC_THETA_VY_INITIAL = 0.0
 INNER_MRAC_THETA_R_INITIAL = 0.0
 INNER_MRAC_THETA_UC_INITIAL = (
@@ -713,7 +713,7 @@ INNER_TV_ENABLE_ADAPTATION = True
 INNER_TV_MAX_ABS_DFX_N = 0.35
 
 # Protection gates
-INNER_TV_MIN_VX_MS = 0.05
+INNER_TV_MIN_VX_MS = 0.25
 INNER_TV_MIN_PHI_NORM = 0.015
 INNER_TV_MAX_DT_S = 0.20
 INNER_TV_MAX_ABS_TRACKING_ERROR = 0.45

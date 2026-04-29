@@ -189,7 +189,7 @@ STATE_SPACE_K_DRAG_COEFF = 0.0
 # Task 3.2. Protects the reduced model from division by tiny vx.
 # Task 3.3 will later decide better scheduling/filtering.
 # ============================================================
-INNER_LATERAL_YAW_MIN_VX_MS = 0.05
+INNER_LATERAL_YAW_MIN_VX_MS = 0.20
 
 
 # Task 3.3 scheduling variable handling.
@@ -352,7 +352,7 @@ INNER_REF_KAPPA_SIGN = 1.0
 
 INNER_REF_MAX_ABS_KAPPA_1PM = 2.0
 INNER_REF_MAX_ABS_R_REF_RAD_S = 1.2
-INNER_REF_MIN_VX_MS = 0.05
+INNER_REF_MIN_VX_MS = 0.20
 
 DEBUG_FIELDS = [
     "speed_cmd",
@@ -423,7 +423,7 @@ MRAC_MAX_PWM_CORRECTION = 0.05
 MRAC_MAX_DELTA_FX_N = 0.30
 
 # Minimum conditions before future MRAC terms are trusted.
-MRAC_MIN_CONTROL_VX_MS = 0.05
+MRAC_MIN_CONTROL_VX_MS = 0.45
 MRAC_REQUIRE_RLS_USED_READY = True
 MRAC_FREEZE_WHEN_RLS_USED_NOT_READY = True
 # ================= End Task 6.0 MRAC safety scaffold =================
@@ -608,7 +608,7 @@ INNER_MRAC_MAX_ABS_TRACKING_ERROR = 999.0
 # Nominal steering feedforward:
 #   r ≈ vx / L * delta
 #   delta ≈ L / vx * r
-INNER_MRAC_NOMINAL_VX_MS = 0.05
+INNER_MRAC_NOMINAL_VX_MS = 0.55
 INNER_MRAC_THETA_VY_INITIAL = 0.0
 INNER_MRAC_THETA_R_INITIAL = 0.0
 INNER_MRAC_THETA_UC_INITIAL = (
@@ -713,7 +713,7 @@ INNER_TV_ENABLE_ADAPTATION = True
 INNER_TV_MAX_ABS_DFX_N = 0.35
 
 # Protection gates
-INNER_TV_MIN_VX_MS = 0.05
+INNER_TV_MIN_VX_MS = 0.25
 INNER_TV_MIN_PHI_NORM = 0.015
 INNER_TV_MAX_DT_S = 0.20
 INNER_TV_MAX_ABS_TRACKING_ERROR = 0.45
@@ -768,56 +768,3 @@ for _field in [
 ]:
     if _field not in DEBUG_FIELDS:
         DEBUG_FIELDS.append(_field)
-
-# ============================================================
-# TASK 7.1: PHASE 7 WHEEL-FORCE ALLOCATION / ACTUATION
-# ------------------------------------------------------------
-# The controller now sends motion from allocated wheel forces,
-# not directly from the old baseline speed_cmd.
-#
-# F_x,L = 0.5 * (F_long - Delta_Fx)
-# F_x,R = 0.5 * (F_long + Delta_Fx)
-#
-# Important:
-# The current B3RB ROS interface still accepts throttle + steering
-# through /cerebri/in/joy. Therefore, the ROS node computes left/right
-# wheel force commands, converts them to left/right wheel PWM estimates,
-# then sends the reconstructed common wheel PWM through the available
-# throttle axis. True independent wheel actuation needs a lower-level
-# Cerebri/Synapse wheel command interface.
-# ============================================================
-
-PHASE7_ACTUATE_FROM_WHEEL_ALLOCATION = True
-PHASE7_USE_OUTER_MRAC_SAT_PWM_ONLY = True
-PHASE7_USE_TV_SAT_DFX_ONLY = True
-
-PHASE7_MAX_ABS_TOTAL_FORCE_N = PROPULSION_FORCE_MAX_ABS_N
-PHASE7_MAX_ABS_WHEEL_FORCE_N = 0.5 * PROPULSION_FORCE_MAX_ABS_N
-PHASE7_MAX_ABS_DFX_N = min(
-    MRAC_MAX_DELTA_FX_N if "MRAC_MAX_DELTA_FX_N" in globals() else 0.30,
-    2.0 * PHASE7_MAX_ABS_WHEEL_FORCE_N,
-)
-
-for _field in [
-    "phase7_mode",
-    "phase7_outer_pwm_source",
-    "phase7_dfx_source",
-    "phase7_outer_pwm_cmd",
-    "phase7_f_long_cmd_n",
-    "phase7_dfx_cmd_n",
-    "phase7_fx_left_n",
-    "phase7_fx_right_n",
-    "phase7_re_f_long_n",
-    "phase7_re_dfx_n",
-    "phase7_f_long_err_n",
-    "phase7_dfx_err_n",
-    "phase7_pwm_left",
-    "phase7_pwm_right",
-    "phase7_pwm_common",
-    "phase7_pwm_diff",
-    "phase7_force_sat",
-    "phase7_dfx_sat",
-]:
-    if _field not in DEBUG_FIELDS:
-        DEBUG_FIELDS.append(_field)
-

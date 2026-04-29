@@ -1108,9 +1108,19 @@ class LineFollower(Node):
 
     def debug_timer_callback(self):
         if not self.estimator.vehicle.odom_ready:
+
+        # Save most recent valid nonzero MRAC inner reference command.
+        # Used only by MRAC-only hold-last mode.
+        try:
+            if inner_mrac_valid and abs(float(inner_uc)) >= self._inner_mrac_hold_last_uc_min_abs:
+                now_s = self.get_clock().now().nanoseconds * 1e-9
+                self._inner_mrac_last_valid_uc = float(inner_uc)
+                self._inner_mrac_last_valid_uc_time = now_s
+        except Exception:
+            pass
+
             self.get_logger().info("[MRAC scaffold] waiting for odometry...")
             return
-
 
         if self.latest_debug_snapshot is None:
             self.get_logger().info("[MRAC scaffold] waiting for first debug snapshot...")
