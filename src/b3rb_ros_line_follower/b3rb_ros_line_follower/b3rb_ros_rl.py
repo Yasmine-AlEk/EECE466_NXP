@@ -46,6 +46,7 @@ import subprocess
 from enum import Enum, auto
 
 import numpy as np
+import torch
 import rclpy
 from geometry_msgs.msg import TwistStamped
 from nav_msgs.msg import Odometry
@@ -162,11 +163,12 @@ class RLRunner(Node):
 
         # ---- declare & read parameters -------------------------------- #
         self.declare_parameter("training",      True)
+        self.declare_parameter("device",        "auto")
         self.declare_parameter("delta_max",     0.30)
         self.declare_parameter("gamma",         0.99)
         self.declare_parameter("lr",            1e-3)
         self.declare_parameter("no_lane_limit", 20)
-        self.declare_parameter("max_steps",     2000)
+        self.declare_parameter("max_steps",     4000)
         self.declare_parameter("settle_steps",  30)
         self.declare_parameter("world_name",    "default")
         self.declare_parameter("weights_path",  "~/rl_policy.pt")
@@ -175,6 +177,18 @@ class RLRunner(Node):
         self.declare_parameter("spawn_z",        0.05)
 
         self._training        = self.get_parameter("training").value
+        requested_device      = str(self.get_parameter("device").value)
+
+        if requested_device == "auto":
+            requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            self.get_logger().warn(
+                "[RL] CUDA requested but torch.cuda.is_available() is False; using CPU"
+            )
+            requested_device = "cpu"
+
+        self._device          = torch.device(requested_device)
         delta_max             = float(self.get_parameter("delta_max").value)
         gamma                 = float(self.get_parameter("gamma").value)
         lr                    = float(self.get_parameter("lr").value)
@@ -218,7 +232,7 @@ class RLRunner(Node):
         ) = _make_mrac_components()
 
         # ---- policy --------------------------------------------------- #
-        self._policy = GaussianPolicy(state_dim=4, hidden_dim=16, delta_max=delta_max)
+        self._policy = GaussianPolicy(state_dim=4, hidden_dim=16, delta_max=delta_max, device=str(self._device))
 
         if self._training:
             self._trainer: REINFORCETrainer | None = REINFORCETrainer(
@@ -229,6 +243,8 @@ class RLRunner(Node):
 
         if os.path.exists(self._weights_path):
             self._policy.load(self._weights_path)
+            if self._training:
+                self._policy.train()
             self.get_logger().info(f"[RL] loaded weights from {self._weights_path}")
         elif not self._training:
             self.get_logger().warn(
@@ -244,7 +260,7 @@ class RLRunner(Node):
 
         mode = "TRAINING" if self._training else "DEPLOYMENT"
         self.get_logger().info(
-            f"[RL] runner started — mode={mode}  delta_max={delta_max}"
+            f"[RL] runner started — mode={mode}  delta_max={delta_max}  device={self._device}"
         )
 
     # ------------------------------------------------------------------ #

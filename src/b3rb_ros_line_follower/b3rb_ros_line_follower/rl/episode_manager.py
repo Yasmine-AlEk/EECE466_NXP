@@ -82,7 +82,8 @@ class REINFORCETrainer:
             G = self._rewards[t] + self.gamma * G
             returns[t] = G
 
-        returns_t = torch.as_tensor(returns, dtype=torch.float32)
+        device = next(self.policy.parameters()).device
+        returns_t = torch.as_tensor(returns, dtype=torch.float32, device=device)
         if self.normalise_returns and T > 1:
             returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 

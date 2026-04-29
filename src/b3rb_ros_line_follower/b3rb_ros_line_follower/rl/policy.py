@@ -22,9 +22,11 @@ class GaussianPolicy(nn.Module):
         state_dim:  int   = 4,
         hidden_dim: int   = 16,
         delta_max:  float = 0.30,
+        device: str = "cpu",
     ) -> None:
         super().__init__()
         self.delta_max = float(delta_max)
+        self.device = torch.device(device)
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -34,6 +36,9 @@ class GaussianPolicy(nn.Module):
         )
         # Initialise log_std = -1  →  std ≈ 0.37 rad: moderate early exploration
         self.log_std = nn.Parameter(torch.tensor(-1.0))
+
+        # Move all neural-network parameters to the selected device.
+        self.to(self.device)
 
     # ------------------------------------------------------------------ #
 
@@ -49,7 +54,7 @@ class GaussianPolicy(nn.Module):
         action   : float  — sampled steering correction, clamped to ±delta_max
         log_prob : Tensor — stays in the computation graph for REINFORCE
         """
-        s    = torch.as_tensor(state_np, dtype=torch.float32)
+        s    = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
         mean = self._mean(s)
         std  = self.log_std.exp().clamp(min=1e-4)
         dist = torch.distributions.Normal(mean, std)
@@ -61,7 +66,7 @@ class GaussianPolicy(nn.Module):
     def act(self, state_np: np.ndarray) -> float:
         """Deterministic forward pass (deployment). No gradient tracking."""
         with torch.no_grad():
-            s = torch.as_tensor(state_np, dtype=torch.float32)
+            s = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
             return float(self._mean(s).item())
 
     # ------------------------------------------------------------------ #
@@ -71,9 +76,10 @@ class GaussianPolicy(nn.Module):
 
     def load(self, path: str) -> None:
         try:
-            sd = torch.load(path, map_location="cpu", weights_only=True)
+            sd = torch.load(path, map_location=self.device, weights_only=True)
         except TypeError:
             # PyTorch < 2.0 does not have weights_only
-            sd = torch.load(path, map_location="cpu")
+            sd = torch.load(path, map_location=self.device)
         self.load_state_dict(sd)
+        self.to(self.device)
         self.eval()
