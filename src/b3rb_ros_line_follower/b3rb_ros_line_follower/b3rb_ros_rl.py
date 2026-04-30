@@ -23,7 +23,9 @@ Topics  (mirrors runner_mrac — no bridge nodes required)
 Parameters
 ----------
   training       bool    True
-  delta_max      float   0.30
+  delta_max      float   0.30    — max steering correction
+  speed_up       float   0.25    — max speed increase the RL can add (m/s)
+  speed_dn       float   0.05    — max speed decrease the RL can apply (m/s)
   gamma          float   0.99
   lr             float   1e-3
   no_lane_limit  int     20
@@ -147,10 +149,12 @@ class RLRunner(Node):
 
         self.declare_parameter("training",      True)
         self.declare_parameter("delta_max",     0.30)
+        self.declare_parameter("speed_up",      0.25)
+        self.declare_parameter("speed_dn",      0.05)
         self.declare_parameter("gamma",         0.99)
         self.declare_parameter("lr",            1e-3)
         self.declare_parameter("no_lane_limit", 20)
-        self.declare_parameter("max_steps",     4000)
+        self.declare_parameter("max_steps",     2000)
         self.declare_parameter("settle_steps",  30)
         self.declare_parameter("world_name",    "default")
         self.declare_parameter("weights_path",  "~/rl_policy.pt")
@@ -161,6 +165,8 @@ class RLRunner(Node):
 
         self._training      = self.get_parameter("training").value
         delta_max           = float(self.get_parameter("delta_max").value)
+        speed_up            = float(self.get_parameter("speed_up").value)
+        speed_dn            = float(self.get_parameter("speed_dn").value)
         gamma               = float(self.get_parameter("gamma").value)
         lr                  = float(self.get_parameter("lr").value)
         self._no_lane_limit = int(self.get_parameter("no_lane_limit").value)
@@ -215,7 +221,10 @@ class RLRunner(Node):
         ) = _make_mrac_components()
 
         # Policy — hidden_dim 32 gives enough capacity without overfitting
-        self._policy = GaussianPolicy(state_dim=4, hidden_dim=32, delta_max=delta_max)
+        self._policy = GaussianPolicy(
+            state_dim=4, hidden_dim=64,
+            delta_max=delta_max, speed_up=speed_up, speed_dn=speed_dn
+        )
 
         if self._training:
             self._trainer: REINFORCETrainer | None = REINFORCETrainer(
@@ -288,17 +297,19 @@ class RLRunner(Node):
         mrac_turn = self._compute_mrac_turn(camera, vehicle, turn_wp, dt_s)
 
         if self._training:
-            delta_rl, log_prob = self._policy.sample(state)
+            (delta_steer, delta_speed), log_prob = self._policy.sample(state)
         else:
-            delta_rl  = self._policy.act(state)
-            log_prob  = None
+            delta_steer, delta_speed = self._policy.act(state)
+            log_prob = None
 
-        turn_cmd = float(np.clip(mrac_turn + delta_rl, -1.0, 1.0))
-        self._publish(speed_wp, turn_cmd)
+        turn_cmd  = float(np.clip(mrac_turn + delta_steer, -1.0, 1.0))
+        # RL speed residual: only applied when lane is visible (MRAC is active)
+        speed_cmd = float(speed_wp + delta_speed) if camera.have_measurement else float(speed_wp)
+        self._publish(speed_cmd, turn_cmd)
 
         if self._training:
             done, terminal_r = self._check_done(camera)
-            reward = terminal_r if done else _reward(camera, vx, delta_rl)
+            reward = terminal_r if done else _reward(camera, vx, delta_speed, float(speed_wp))
             self._trainer.store(log_prob, reward)   # type: ignore[arg-type]
             self._step_cnt += 1
             if done:
@@ -368,10 +379,10 @@ class RLRunner(Node):
             self._no_lane_cnt = 0
 
         if self._no_lane_cnt >= self._no_lane_limit:
-            return True, -10.0    # FIX 4: larger terminal penalty (was -1.0)
+            return True, -10.0   # went off-track
 
         if self._step_cnt >= self._max_steps:
-            return True, +2.0     # completion bonus
+            return True, 0.0     # step cap
 
         return False, 0.0
 
@@ -461,23 +472,34 @@ def _build_state(camera, vx: float, ax: float) -> np.ndarray:
     return np.array([ye, psi_rel, vx, ax], dtype=np.float32) * _S_SCALE
 
 
-def _reward(camera, vx: float, delta_rl: float) -> float:
+def _reward(camera, vx: float, delta_speed: float, speed_baseline: float) -> float:
     """
-    Step reward:
-        +β_v · vx · cos(θ_e)  — forward progress aligned with lane
-        −β_e · e_y²            — quadratic lane-centering penalty
-        −β_δ · δ_rl²           — smooth action regularisation
-    Quadratic penalties (vs absolute value) give smoother, more informative
-    gradients and don't collapse to zero near the optimum.
+    Step reward.
+
+    The key insight: reward speed ABOVE baseline, not absolute speed.
+    vx_excess = vx - speed_baseline is ~0 when RL adds nothing, positive
+    when RL is successfully pushing the car faster. This gives a non-flat
+    gradient even when vx is nearly constant across episodes.
+
+        +β_e  · vx_excess          — reward every m/s gained above baseline
+        +β_a  · delta_speed        — immediate bonus for choosing to accelerate
+        −β_y  · e_y²               — quadratic lane-centering penalty
+        −β_θ  · θ_e²               — heading alignment penalty
+        −β_δ  · delta_speed²       — tiny regularisation
     """
     if not camera.have_measurement:
         return -0.5
-    theta_e = camera.psi_rel_cam_filt
-    e_y     = camera.ye_cam_filt
+
+    theta_e    = camera.psi_rel_cam_filt
+    e_y        = camera.ye_cam_filt
+    vx_excess  = vx - speed_baseline   # how much faster than baseline
+
     return float(
-        1.0  * vx * float(np.cos(theta_e))
-        - 0.5 * (e_y ** 2)
-        - 0.05 * (delta_rl ** 2)
+          5.0  * vx_excess            # strongly reward speed above baseline
+        + 1.0  * delta_speed          # immediate acceleration bonus
+        - 1.0  * (e_y ** 2)           # lane-centering penalty
+        - 0.3  * (theta_e ** 2)       # heading alignment
+        - 0.05 * (delta_speed ** 2)   # regularisation
     )
 
 
