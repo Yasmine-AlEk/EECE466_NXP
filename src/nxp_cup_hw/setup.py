@@ -8,6 +8,9 @@ setup(
     name=package_name,
     version="0.1.0",
     packages=find_packages(exclude=["test"]),
+    package_data={
+        "nxp_cup_hw": ["I2C/motor_calibration.csv"],
+    },
     data_files=[
         ("share/ament_index/resource_index/packages",
             ["resource/" + package_name]),
@@ -33,6 +36,10 @@ setup(
             "vision_stream          = nxp_cup_hw.Vision.vision_stream:main",
             "teleop                 = nxp_cup_hw.Models.teleop:main",
             "pca9685_node           = nxp_cup_hw.I2C.pca9685_node:main",
+            "pcf8574ap_node         = nxp_cup_hw.I2C.pcf8574ap_node:main",
+            "mpu6050_node           = nxp_cup_hw.I2C.mpu6050_node:main",
+            "odom_fusion_node       = nxp_cup_hw.Models.odom_fusion_node:main",
+            "lane_to_edge_vectors   = nxp_cup_hw.Vision.lane_to_edge_vectors:main",
         ],
     },
 )

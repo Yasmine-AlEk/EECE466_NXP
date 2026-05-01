@@ -14,13 +14,13 @@ def generate_launch_description():
         ),
 
         # ── Stream viewer ────────────────────────────────────────────────────────
-        Node(
-            package="nxp_cup_hw",
-            executable="vision_stream",
-            name="vision_stream",
-            output="screen",
-
-        ),
+#        Node(
+#            package="nxp_cup_hw",
+#            executable="vision_stream",
+#            name="vision_stream",
+#            output="screen",
+#
+#        ),
 
         # ── Bicycle model ─────────────────────────────────────────────────────
         Node(
@@ -37,6 +37,14 @@ def generate_launch_description():
             }],
         ),
 
+        # ── Lane chain → EdgeVectors bridge (for b3rb_ros_mrac) ─────────────
+        Node(
+            package="nxp_cup_hw",
+            executable="lane_to_edge_vectors",
+            name="lane_to_edge_vectors",
+            output="screen",
+        ),
+
         Node(
             package="nxp_cup_hw",
             executable="pca9685_node", 
@@ -44,7 +52,19 @@ def generate_launch_description():
 
         Node(
             package="nxp_cup_hw",
-            executable="pcf8574ap_node", 
+            executable="pcf8574ap_node",
             output="screen"),
+
+        Node(
+            package="nxp_cup_hw",
+            executable="mpu6050_node",
+            output="screen"),
+
+        Node(
+            package="nxp_cup_hw",
+            executable="odom_fusion_node",
+            output="screen",
+            parameters=[{"use_imu": False}],   # set True to enable IMU fusion
+        ),
 
     ])

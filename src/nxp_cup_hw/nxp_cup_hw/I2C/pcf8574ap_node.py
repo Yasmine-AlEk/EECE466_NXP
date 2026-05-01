@@ -91,7 +91,10 @@ class EncoderOdometryNode(Node):
         self._last_odom_ros_t = self.get_clock().now()
 
         # ── ROS publisher + TF broadcaster ───────────────────────────────────
-        self._odom_pub = self.create_publisher(Odometry, "odom", 10)
+        # Publish raw encoder odometry to internal topic for fusion node.
+        # The fusion node combines this with IMU and republishes to
+        # /cerebri/out/odometry and /nxp_cup/wheel_odom.
+        self._odom_pub = self.create_publisher(Odometry, "/nxp_cup/encoder_odom", 10)
         self._tf_br    = tf2_ros.TransformBroadcaster(self)
 
         # ── Timers ────────────────────────────────────────────────────────────
@@ -145,8 +148,7 @@ class EncoderOdometryNode(Node):
                 self._rad_s[idx] = 0.0
 
         omega_l, omega_r = self._rad_s          # rad/s
-        print("omega_l = ", omega_l)
-        print("omega_r = ", omega_r)
+        self.get_logger().debug(f"omega_l={omega_l:.3f}  omega_r={omega_r:.3f}")
         v_l = omega_l * self.r                  # linear speed left  wheel [m/s]
         v_r = omega_r * self.r                  # linear speed right wheel [m/s]
 
