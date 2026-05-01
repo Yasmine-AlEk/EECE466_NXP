@@ -31,6 +31,8 @@ setup(
             "nxp_cam_init           = nxp_cup_hw.Vision.vision_basic:main",
             "nxp_bicycle_model_node = nxp_cup_hw.Models.bicycle:main",
             "vision_stream          = nxp_cup_hw.Vision.vision_stream:main",
+            "teleop                 = nxp_cup_hw.Models.teleop:main",
+            "pca9685_node           = nxp_cup_hw.I2C.pca9685_node:main",
         ],
     },
 )
