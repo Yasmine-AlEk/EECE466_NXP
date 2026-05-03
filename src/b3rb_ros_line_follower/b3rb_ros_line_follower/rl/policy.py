@@ -1,145 +1,154 @@
+import math
+from typing import Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 
 
-class GaussianPolicy(nn.Module):
+class ActorCriticPolicy(nn.Module):
     """
-    Two-output Gaussian policy: [δ_steer, δ_speed]
+    Actor-critic policy for residual control on top of MRAC.
 
-    δ_steer  ∈ [-steer_max,  +steer_max]   additive correction on MRAC turn cmd
-    δ_speed  ∈ [-speed_dn,   +speed_up]    additive correction on baseline speed
+    Action:
+        d_steer: additive residual on MRAC steering command
+        d_speed: additive residual on baseline speed command
 
-    The speed output is intentionally asymmetric:
-      - can increase speed by up to speed_up   (aggressive upward push)
-      - can decrease speed by up to speed_dn   (small safety margin only)
-    This asymmetry biases exploration toward going faster while still letting
-    the policy brake slightly before tight corners.
-
-    Architecture: 4 → 64 → 64 → 2  (Tanh activations)
-    Two hidden layers with 64 units give enough capacity for the joint
-    steer+speed policy without over-fitting.
+    Important:
+        The maximum RL contribution is NOT hard-coded here.
+        It is still controlled by ROS parameters:
+            delta_max, speed_up, speed_dn
     """
 
     def __init__(
         self,
-        state_dim:  int   = 4,
-        hidden_dim: int   = 64,      # wider than before to handle 2-output task
-        delta_max:  float = 0.30,    # steering correction limit
-        speed_up:   float = 0.25,    # max speed increase above baseline (m/s)
-        speed_dn:   float = 0.05,    # max speed decrease below baseline (m/s)
+        state_dim: int = 4,
+        hidden_dim: int = 64,
+        delta_max: float = 0.30,
+        speed_up: float = 0.25,
+        speed_dn: float = 0.05,
         device: str = "cpu",
     ) -> None:
         super().__init__()
-        self.delta_max = float(delta_max)
-        self.speed_up  = float(speed_up)
-        self.speed_dn  = float(speed_dn)
-        self.device    = torch.device(device)
 
-        self.net = nn.Sequential(
+        self.delta_max = float(delta_max)
+        self.speed_up = float(speed_up)
+        self.speed_dn = float(speed_dn)
+        self.device = torch.device(device)
+
+        self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
-            nn.Linear(hidden_dim, 2),   # [steer_raw, speed_raw] both in (-1,1)
+        )
+
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_dim, 2),
             nn.Tanh(),
         )
 
-        # Two independent log-stds, both initialised to -1.5 (std ≈ 0.22)
-        # so the policy starts conservative and explores from there.
-        self.log_std = nn.Parameter(torch.tensor([-1.5, -1.5]))
+        self.critic = nn.Linear(hidden_dim, 1)
 
-        # Small orthogonal init → policy starts near zero residual,
-        # letting MRAC do all the work on episode 1.
-        for m in self.net.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.05)
-                nn.init.zeros_(m.bias)
+        # Conservative exploration at the start.
+        self.log_std = nn.Parameter(torch.tensor([-1.7, -1.7], dtype=torch.float32))
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=0.05)
+                nn.init.zeros_(module.bias)
 
         self.to(self.device)
 
-    # ------------------------------------------------------------------ #
-
-    def _raw_mean(self, s: torch.Tensor) -> torch.Tensor:
-        """Raw network output in (-1, 1) for each action dimension."""
-        return self.net(s)   # shape (..., 2)
+    def _features(self, state: torch.Tensor) -> torch.Tensor:
+        return self.shared(state)
 
     def _scale_action(self, raw: torch.Tensor) -> torch.Tensor:
         """
-        Scale the two raw outputs asymmetrically:
-          steer:  raw * delta_max              → symmetric ±delta_max
-          speed:  positive raw → +speed_up     → asymmetric [-speed_dn, +speed_up]
-                  negative raw → -speed_dn
+        raw[:,0] -> steering residual in [-delta_max, +delta_max]
+        raw[:,1] -> speed residual using piecewise scaling:
+                    negative side limited by speed_dn
+                    positive side limited by speed_up
+
+        This keeps raw=0 mapped to d_speed=0, so the policy starts by
+        preserving the MRAC/baseline behavior instead of always adding speed.
         """
         steer_raw = raw[..., 0:1]
         speed_raw = raw[..., 1:2]
 
-        steer  = steer_raw * self.delta_max
-        # Asymmetric scaling: remap (-1,1) → (-speed_dn, +speed_up)
-        mid    = (self.speed_up - self.speed_dn) / 2.0
-        half   = (self.speed_up + self.speed_dn) / 2.0
-        speed  = speed_raw * half + mid
+        d_steer = steer_raw * self.delta_max
+        d_speed = torch.where(
+            speed_raw >= 0.0,
+            speed_raw * self.speed_up,
+            speed_raw * self.speed_dn,
+        )
 
-        return torch.cat([steer, speed], dim=-1)
+        return torch.cat([d_steer, d_speed], dim=-1)
 
-    # ------------------------------------------------------------------ #
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        features = self._features(state)
+        raw_mean = self.actor(features)
+        value = self.critic(features).squeeze(-1)
+        return raw_mean, value
 
     def sample(self, state_np: np.ndarray):
         """
-        Stochastic forward pass for training.
+        Training-time stochastic action.
 
-        Returns
-        -------
-        actions   : (δ_steer: float, δ_speed: float)
-        log_probs : Tensor shape (2,) — stays in computation graph
+        Returns:
+            (d_steer, d_speed), log_prob, value, entropy
         """
-        s    = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
-        mean = self._raw_mean(s)                               # (2,)
-        std  = self.log_std.exp().clamp(min=1e-4, max=1.0)   # (2,)
-        dist = torch.distributions.Normal(mean, std)
-        raw  = dist.rsample()                                  # (2,)
+        state = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
 
-        # Clamp to valid raw range before scaling
-        raw_clamped = raw.clamp(-1.0, 1.0)
-        actions = self._scale_action(raw_clamped)
+        raw_mean, value = self.forward(state)
 
-        log_probs = dist.log_prob(raw)                         # (2,)
-        log_prob_sum = log_probs.sum()                         # scalar Tensor
+        std = self.log_std.exp().clamp(min=1e-4, max=0.8)
+        dist = torch.distributions.Normal(raw_mean, std)
 
-        d_steer = float(actions[0].item())
-        d_speed = float(actions[1].item())
-        return (d_steer, d_speed), log_prob_sum
+        raw_action = dist.rsample()
+        raw_action_clamped = raw_action.clamp(-1.0, 1.0)
+
+        scaled_action = self._scale_action(raw_action_clamped)
+
+        log_prob = dist.log_prob(raw_action).sum()
+        entropy = dist.entropy().sum()
+
+        d_steer = float(scaled_action[0].item())
+        d_speed = float(scaled_action[1].item())
+
+        return (d_steer, d_speed), log_prob, value, entropy
 
     def act(self, state_np: np.ndarray):
-        """Deterministic forward pass for deployment."""
+        """
+        Deployment-time deterministic action.
+        """
         with torch.no_grad():
-            s       = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
-            raw     = self._raw_mean(s)
-            actions = self._scale_action(raw)
-            return float(actions[0].item()), float(actions[1].item())
+            state = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
+            raw_mean, _ = self.forward(state)
+            scaled_action = self._scale_action(raw_mean)
 
-    def entropy(self) -> torch.Tensor:
-        """Sum of per-dimension Gaussian entropies."""
-        return (self.log_std + 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi)))).sum()
+            d_steer = float(scaled_action[0].item())
+            d_speed = float(scaled_action[1].item())
 
-    # ------------------------------------------------------------------ #
+            return d_steer, d_speed
 
     def save(self, path: str) -> None:
         torch.save(self.state_dict(), path)
 
-    def load(self, path: str) -> None:
-        """Load weights, gracefully ignoring shape mismatches (stale checkpoints)."""
+    def load(self, path: str) -> bool:
         try:
             try:
-                sd = torch.load(path, map_location=self.device, weights_only=True)
+                state_dict = torch.load(path, map_location=self.device, weights_only=True)
             except TypeError:
-                sd = torch.load(path, map_location=self.device)
-            self.load_state_dict(sd)
+                state_dict = torch.load(path, map_location=self.device)
+
+            self.load_state_dict(state_dict)
             self.to(self.device)
-            self.eval()
-        except (RuntimeError, Exception) as exc:
+            return True
+
+        except Exception as exc:
             import warnings
             warnings.warn(
-                f"[RL policy] ignoring incompatible checkpoint at {path} "
-                f"({exc}). Starting with fresh weights."
+                f"[RL policy] could not load checkpoint {path}; starting fresh. Error: {exc}"
             )
+            return False
