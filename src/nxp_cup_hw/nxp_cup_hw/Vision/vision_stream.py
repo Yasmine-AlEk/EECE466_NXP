@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
+vision_stream.py
+----------------
 NXP Cup – Vision Stream Dashboard
-===================================
-Layout:
-  Top-left  : BEV camera + full lane chains + 2 MRAC edge vectors
-  Top-right : Unified twist comparison (encoder / IMU / fused) — vx & wz
+Reads from the nxp_cup_vision package.
+
+  Top-left  : Debug image from nxp_cup_vision + EdgeVectors overlay
+  Top-right : Twist comparison (encoder / IMU / fused)
   Bottom-left: IMU raw (ax, ay, az, gz)
-  Bottom-right: Encoder odometry detail (vx, wz)
+  Bottom-right: Encoder odometry (vx, wz)
 
 http://<navqplus-ip>:8081
 """
@@ -21,20 +23,19 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-    from std_msgs.msg import String, Int32MultiArray
     from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import Imu, Image
-    from cv_bridge import CvBridge
+    from sensor_msgs.msg import Imu, CompressedImage
+    from synapse_msgs.msg import EdgeVectors
 except ImportError:
     print("[ERROR] source /opt/ros/humble/setup.bash first")
     sys.exit(1)
 
-DEFAULT_PORT  = 8081
-DEFAULT_SCALE = 2
-JPEG_QUALITY  = 75
-BEV_W, BEV_H  = 400, 300
+DEFAULT_PORT = 8081
+JPEG_QUALITY = 75
+CANVAS_W     = 640
+CANVAS_H     = 480
 
-# ── Shared state ──────────────────────────────────────────────────────────────
+# ── Shared state ──────────────────────────────────────────────
 
 class _Slot:
     def __init__(self):
@@ -51,102 +52,47 @@ class _Slot:
                 return self._seq, self._jpg
         return s, None
 
-_slot_cam      = _Slot()
-_enc_params    = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-_frame_lock    = threading.Lock()
-_latest_frame  = None
-_chain_lock    = threading.Lock()
-_latest_chains = None
-_sensor_lock   = threading.Lock()
-_imu_data         = None
-_fused_odom_data  = None   # /nxp_cup/wheel_odom  (encoder + IMU fused)
-_enc_odom_data    = None   # /nxp_cup/encoder_odom (encoder only)
+_slot_cam        = _Slot()
+_enc_params      = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+_frame_lock      = threading.Lock()
+_latest_frame    = None          # raw BGR from CompressedImage
+_ev_lock         = threading.Lock()
+_latest_ev       = None          # EdgeVectors msg
+_sensor_lock     = threading.Lock()
+_imu_data        = None
+_fused_odom_data = None
+_enc_odom_data   = None
 
-# Colours
-C_LEFT      = ( 80,  80, 255)
-C_RIGHT     = ( 80, 200,  80)
-C_CENTER    = (255, 180,   0)
-C_CROSSLINK = (100, 100, 100)
-C_CORRIDOR  = ( 40,  80,  40)
-C_DOT_L     = (140, 140, 255)
-C_DOT_R     = (140, 255, 140)
-C_TEXT      = (220, 220, 220)
-C_VEC_L     = (  0, 220, 255)   # cyan  – left MRAC vector
-C_VEC_R     = (255, 100, 200)   # pink  – right MRAC vector
+# ── Overlay ───────────────────────────────────────────────────
 
-# ── Camera frame builder ──────────────────────────────────────────────────────
-
-def _proj(x, y, bev_w, bev_h, cw, ch):
-    return (int(x / bev_w * cw), int(y / bev_h * ch))
-
-
-def overlay_chains(canvas, data, bev_w, bev_h):
-    """Draw full lane chains + corridor fill + 2 MRAC edge vectors."""
+def overlay_edge_vectors(canvas, ev: EdgeVectors):
+    """
+    Draw EdgeVectors lines onto the canvas.
+    Coords are in BEV space (400x300), scaled to canvas size.
+    """
     cw, ch = canvas.shape[1], canvas.shape[0]
-    def p(x, y): return _proj(x, y, bev_w, bev_h, cw, ch)
+    sx = cw / 400.0
+    sy = ch / 300.0
 
-    left   = [tuple(pt) for pt in data.get("left",   [])]
-    right  = [tuple(pt) for pt in data.get("right",  [])]
-    center = [tuple(pt) for pt in data.get("center", [])]
+    def pt(p):
+        return (int(p.x * sx), int(p.y * sy))
 
-    # Corridor fill
-    if len(left) > 1 and len(right) > 1:
-        poly = [p(x, y) for x, y in left] + [p(x, y) for x, y in reversed(right)]
-        ov = canvas.copy()
-        cv2.fillPoly(ov, [np.array(poly, dtype=np.int32)], C_CORRIDOR)
-        canvas = cv2.addWeighted(canvas, 0.55, ov, 0.45, 0)
+    if ev.vector_count >= 1:
+        p0 = pt(ev.vector_1[0]); p1 = pt(ev.vector_1[1])
+        cv2.line(canvas, p0, p1, (60, 60, 255), 3, cv2.LINE_AA)
+        cv2.circle(canvas, p0, 6, (60, 60, 255), -1)
+        cv2.circle(canvas, p1, 6, (60, 60, 255), -1)
 
-    # Cross-links
-    n = data.get("n_strips", 24)
-    if left and right:
-        def near(c, yt): return min(c, key=lambda pt: abs(pt[1] - yt))
-        for sy in np.linspace(0, bev_h, n, endpoint=False):
-            cv2.line(canvas, p(*near(left, sy)), p(*near(right, sy)), C_CROSSLINK, 1)
+    if ev.vector_count >= 2:
+        p0 = pt(ev.vector_2[0]); p1 = pt(ev.vector_2[1])
+        cv2.line(canvas, p0, p1, (255, 60, 60), 3, cv2.LINE_AA)
+        cv2.circle(canvas, p0, 6, (255, 60, 60), -1)
+        cv2.circle(canvas, p1, 6, (255, 60, 60), -1)
 
-    # Full chains (polylines)
-    def draw_chain(chain, cl, cd, t=2):
-        pts = [p(x, y) for x, y in chain]
-        for i in range(1, len(pts)):
-            cv2.line(canvas, pts[i - 1], pts[i], cl, t, cv2.LINE_AA)
-        for pt in pts:
-            cv2.circle(canvas, pt, 4, cd, -1)
-
-    draw_chain(left,   C_LEFT,   C_DOT_L)
-    draw_chain(right,  C_RIGHT,  C_DOT_R)
-    draw_chain(center, C_CENTER, C_CENTER, 2)
-
-    # ── 2 MRAC edge vectors (bottom→top of each chain) ───────────────────────
-    # These are exactly what lane_to_edge_vectors feeds to the MRAC:
-    # one straight line per side from nearest (index 0) to farthest (index -1).
-    for chain, color in ((left, C_VEC_L), (right, C_VEC_R)):
-        if len(chain) >= 2:
-            pt_bot = p(*chain[0])    # nearest  (high y, front of car)
-            pt_top = p(*chain[-1])   # farthest (low y,  far ahead)
-            cv2.line(canvas, pt_bot, pt_top, color, 3, cv2.LINE_AA)
-            # Arrowhead at top
-            cv2.arrowedLine(canvas, pt_bot, pt_top, color, 3,
-                            cv2.LINE_AA, tipLength=0.15)
-            # Endpoint dots
-            cv2.circle(canvas, pt_bot, 6, color, -1)
-            cv2.circle(canvas, pt_top, 6, color, -1)
-
-    # HUD
-    valid = data.get("valid", {})
-    age   = (time.time() - data["stamp"]) * 1000 if data.get("stamp") else 0
-    hud = [
-        f"L {len(left):>2}pts {'OK' if valid.get('left') else '--'}  "
-        f"R {len(right):>2}pts {'OK' if valid.get('right') else '--'}  "
-        f"C {len(center):>2}pts",
-        f"Corridor {int(data.get('corridor_area', 0))}px  age {age:.0f}ms",
-        f"Vec L: ({left[0][0]:.0f},{left[0][1]:.0f})→({left[-1][0]:.0f},{left[-1][1]:.0f})"
-        if len(left) >= 2 else "",
-        f"Vec R: ({right[0][0]:.0f},{right[0][1]:.0f})→({right[-1][0]:.0f},{right[-1][1]:.0f})"
-        if len(right) >= 2 else "",
-    ]
-    for i, txt in enumerate(hud):
-        if txt:
-            cv2.putText(canvas, txt, (6, 15 + i * 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, C_TEXT, 1, cv2.LINE_AA)
+    l_ok = "OK" if ev.vector_count >= 1 else "--"
+    r_ok = "OK" if ev.vector_count >= 2 else "--"
+    cv2.putText(canvas, f"L:{l_ok}  R:{r_ok}", (6, ch - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 100), 1, cv2.LINE_AA)
     return canvas
 
 
@@ -156,14 +102,13 @@ def build_cam_frame(canvas_w, canvas_h):
     canvas = cv2.resize(raw, (canvas_w, canvas_h)) if raw is not None \
         else np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     if raw is None:
-        cv2.putText(canvas, "Waiting for camera…", (10, canvas_h // 2),
+        cv2.putText(canvas, "Waiting for nxp_cup_vision…", (10, canvas_h // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 120), 1, cv2.LINE_AA)
-    with _chain_lock:
-        chains = _latest_chains
-    if chains:
-        canvas = overlay_chains(canvas, chains,
-                                chains.get("bev_w", BEV_W),
-                                chains.get("bev_h", BEV_H))
+        return canvas
+    with _ev_lock:
+        ev = _latest_ev
+    if ev is not None:
+        canvas = overlay_edge_vectors(canvas, ev)
     return canvas
 
 
@@ -173,7 +118,7 @@ def push_cam(canvas_w, canvas_h):
         _slot_cam.push(jpg.tobytes())
 
 
-# ── Dashboard HTML ────────────────────────────────────────────────────────────
+# ── Dashboard HTML ────────────────────────────────────────────
 
 def _make_dashboard():
     return r"""<!doctype html>
@@ -195,7 +140,7 @@ body{background:#080c10;color:#ccc;font:11px 'Courier New',monospace;height:100v
 </head><body>
 
 <div class="panel">
-  <div class="panel-title">BEV CAMERA <span>+ lane chains + MRAC vectors</span></div>
+  <div class="panel-title">CAMERA <span>nxp_cup_vision + EdgeVectors overlay</span></div>
   <img src="/stream">
 </div>
 
@@ -216,69 +161,45 @@ body{background:#080c10;color:#ccc;font:11px 'Courier New',monospace;height:100v
 
 <script>
 const N = 80;
-
-const DARK_GRID = '#1a2030';
+const DARK_GRID  = '#1a2030';
 const TICK_COLOR = '#556070';
 
-function mkChart(id, defs, y2defs) {
+function mkChart(id, defs, y2) {
     const datasets = defs.map(d => ({
-        label: d.label,
-        data: [],
-        borderColor: d.color,
-        backgroundColor: 'transparent',
-        borderWidth: 1.5,
-        pointRadius: 0,
-        tension: 0.25,
-        spanGaps: true,
-        yAxisID: d.y2 ? 'y2' : 'y',
+        label: d.label, data: [],
+        borderColor: d.color, backgroundColor: 'transparent',
+        borderWidth: 1.5, pointRadius: 0, tension: 0.25,
+        spanGaps: true, yAxisID: d.y2 ? 'y2' : 'y',
     }));
-
     const scales = {
         x: { display: false },
-        y: {
-            position: 'left',
-            ticks: { color: TICK_COLOR, font: { size: 9 }, maxTicksLimit: 5 },
-            grid: { color: DARK_GRID }
-        }
+        y: { position: 'left',
+             ticks: { color: TICK_COLOR, font: { size: 9 }, maxTicksLimit: 5 },
+             grid: { color: DARK_GRID } }
     };
-    if (y2defs) {
-        scales.y2 = {
-            position: 'right',
-            ticks: { color: TICK_COLOR, font: { size: 9 }, maxTicksLimit: 5 },
-            grid: { drawOnChartArea: false }
-        };
-    }
-
+    if (y2) scales.y2 = {
+        position: 'right',
+        ticks: { color: TICK_COLOR, font: { size: 9 }, maxTicksLimit: 5 },
+        grid: { drawOnChartArea: false }
+    };
     return new Chart(document.getElementById(id), {
-        type: 'line',
-        data: { labels: [], datasets },
-        options: {
-            animation: false,
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: { mode: 'index', intersect: false },
-            plugins: {
-                legend: {
-                    labels: { color: '#8090a0', boxWidth: 8, font: { size: 9 }, padding: 6 }
-                }
-            },
-            scales
-        }
+        type: 'line', data: { labels: [], datasets },
+        options: { animation: false, responsive: true, maintainAspectRatio: false,
+                   interaction: { mode: 'index', intersect: false },
+                   plugins: { legend: { labels: { color: '#8090a0', boxWidth: 8,
+                                                  font: { size: 9 }, padding: 6 } } },
+                   scales }
     });
 }
 
-// ── Chart definitions ────────────────────────────────────────────────────────
-
-// Twist comparison: vx on left axis, wz on right axis
 const twistChart = mkChart('c-twist', [
-    { label: 'vx enc',   color: '#f07030', y2: false },
-    { label: 'vx fused', color: '#ffcc00', y2: false },
-    { label: 'wz enc',   color: '#3090f0', y2: true  },
-    { label: 'wz imu/gz',color: '#30d0d0', y2: true  },
-    { label: 'wz fused', color: '#80ff80', y2: true  },
+    { label: 'vx enc',    color: '#f07030', y2: false },
+    { label: 'vx fused',  color: '#ffcc00', y2: false },
+    { label: 'wz enc',    color: '#3090f0', y2: true  },
+    { label: 'wz imu/gz', color: '#30d0d0', y2: true  },
+    { label: 'wz fused',  color: '#80ff80', y2: true  },
 ], true);
 
-// IMU raw
 const imuChart = mkChart('c-imu', [
     { label: 'ax', color: '#ff5555' },
     { label: 'ay', color: '#55ff55' },
@@ -286,17 +207,13 @@ const imuChart = mkChart('c-imu', [
     { label: 'gz', color: '#ffaa00' },
 ]);
 
-// Encoder odometry
 const encChart = mkChart('c-enc', [
-    { label: 'vx enc',  color: '#f07030', y2: false },
-    { label: 'wz enc',  color: '#3090f0', y2: true  },
+    { label: 'vx enc', color: '#f07030', y2: false },
+    { label: 'wz enc', color: '#3090f0', y2: true  },
 ], true);
 
-// ── Push helper ───────────────────────────────────────────────────────────────
-
 function push(chart, ...vals) {
-    const now = Date.now();
-    chart.data.labels.push(now);
+    chart.data.labels.push(Date.now());
     if (chart.data.labels.length > N) chart.data.labels.shift();
     chart.data.datasets.forEach((ds, i) => {
         ds.data.push(vals[i] != null ? vals[i] : null);
@@ -305,44 +222,32 @@ function push(chart, ...vals) {
     chart.update('none');
 }
 
-// ── Polling loop ──────────────────────────────────────────────────────────────
-
 let t = 0;
 setTimeout(() => {
     setInterval(async () => {
         try {
             const resp = await fetch('/data?t=' + (t++));
             const d    = await resp.json();
-
-            // Twist comparison
             push(twistChart,
-                d.enc  ? d.enc.vx  : null,
-                d.fused? d.fused.vx: null,
-                d.enc  ? d.enc.wz  : null,
-                d.imu  ? d.imu.gz  : null,
-                d.fused? d.fused.wz: null
+                d.enc  ? d.enc.vx   : null,
+                d.fused? d.fused.vx : null,
+                d.enc  ? d.enc.wz   : null,
+                d.imu  ? d.imu.gz   : null,
+                d.fused? d.fused.wz : null
             );
-
-            // IMU raw
             if (d.imu) push(imuChart, d.imu.ax, d.imu.ay, d.imu.az, d.imu.gz);
-
-            // Encoder odometry
             if (d.enc) push(encChart, d.enc.vx, d.enc.wz);
-
-            // HUD text
-            if (d.fused) {
+            if (d.fused)
                 document.getElementById('h-twist').textContent =
                     `vx enc:${(d.enc?d.enc.vx:0).toFixed(2)} fused:${d.fused.vx.toFixed(2)}  `+
                     `wz gz:${(d.imu?d.imu.gz:0).toFixed(3)} fused:${d.fused.wz.toFixed(3)}`;
-            }
-            if (d.imu) {
+            if (d.imu)
                 document.getElementById('h-imu').textContent =
-                    `ax:${d.imu.ax.toFixed(2)} ay:${d.imu.ay.toFixed(2)} az:${d.imu.az.toFixed(2)} gz:${d.imu.gz.toFixed(3)}`;
-            }
-            if (d.enc) {
+                    `ax:${d.imu.ax.toFixed(2)} ay:${d.imu.ay.toFixed(2)} `+
+                    `az:${d.imu.az.toFixed(2)} gz:${d.imu.gz.toFixed(3)}`;
+            if (d.enc)
                 document.getElementById('h-enc').textContent =
                     `vx:${d.enc.vx.toFixed(3)} m/s   wz:${d.enc.wz.toFixed(3)} r/s`;
-            }
         } catch(e) { console.error(e); }
     }, 150);
 }, 1000);
@@ -350,14 +255,13 @@ setTimeout(() => {
 </body></html>"""
 
 
-# ── HTTP handler ──────────────────────────────────────────────────────────────
+# ── HTTP handler ──────────────────────────────────────────────
 
 class _Handler(BaseHTTPRequestHandler):
-    _canvas_w = BEV_W * DEFAULT_SCALE
-    _canvas_h = BEV_H * DEFAULT_SCALE
+    _canvas_w = CANVAS_W
+    _canvas_h = CANVAS_H
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, *a): pass
 
     def do_GET(self):
         if self.path.startswith('/data'):
@@ -412,43 +316,44 @@ def start_server(port, canvas_w, canvas_h):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
-# ── ROS 2 node ────────────────────────────────────────────────────────────────
+# ── ROS 2 node ────────────────────────────────────────────────
 
 class VisionStreamNode(Node):
     def __init__(self, canvas_w, canvas_h):
         super().__init__('vision_stream')
-        self._cw     = canvas_w
-        self._ch     = canvas_h
-        self._bridge = CvBridge()
+        self._cw = canvas_w
+        self._ch = canvas_h
         be = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                         durability=DurabilityPolicy.VOLATILE, depth=5)
 
-        self.create_subscription(Image,    '/nxp_cup/debug_image',   self._on_image,       10)
-        self.create_subscription(String,   '/nxp_cup/lane_chains',   self._on_chains,      10)
-        self.create_subscription(Imu,      '/nxp_cup/imu',           self._on_imu,         be)
-        self.create_subscription(Odometry, '/nxp_cup/wheel_odom',    self._on_fused_odom,  be)
-        self.create_subscription(Odometry, '/nxp_cup/encoder_odom',  self._on_enc_odom,    be)
+        # RELIABLE depth=10 — must match publisher (nxp_track_vision)
+        self.create_subscription(
+            CompressedImage, '/nxp_cup/debug_image', self._on_image, 10)
+        self.create_subscription(
+            EdgeVectors, '/edge_vectors', self._on_edge_vectors, 10)
+        self.create_subscription(
+            Imu,      '/nxp_cup/imu',          self._on_imu,        be)
+        self.create_subscription(
+            Odometry, '/nxp_cup/wheel_odom',   self._on_fused_odom, be)
+        self.create_subscription(
+            Odometry, '/nxp_cup/encoder_odom', self._on_enc_odom,   be)
 
         self.get_logger().info('VisionStreamNode ready')
 
-    def _on_image(self, msg):
+    def _on_image(self, msg: CompressedImage):
         global _latest_frame
-        try:
-            bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception:
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        bgr    = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if bgr is None:
             return
         with _frame_lock:
             _latest_frame = bgr
         push_cam(self._cw, self._ch)
 
-    def _on_chains(self, msg):
-        global _latest_chains
-        try:
-            data = json.loads(msg.data)
-        except Exception:
-            return
-        with _chain_lock:
-            _latest_chains = data
+    def _on_edge_vectors(self, msg: EdgeVectors):
+        global _latest_ev
+        with _ev_lock:
+            _latest_ev = msg
         push_cam(self._cw, self._ch)
 
     def _on_imu(self, msg):
@@ -473,8 +378,8 @@ class VisionStreamNode(Node):
                 'wz':  msg.twist.twist.angular.z,
                 'x':   msg.pose.pose.position.x,
                 'y':   msg.pose.pose.position.y,
-                'yaw': math.atan2(2 * (q.w * q.z + q.x * q.y),
-                                  1 - 2 * (q.y ** 2 + q.z ** 2)),
+                'yaw': math.atan2(2*(q.w*q.z + q.x*q.y),
+                                  1 - 2*(q.y**2 + q.z**2)),
                 'stamp': time.time(),
             }
 
@@ -488,7 +393,7 @@ class VisionStreamNode(Node):
             }
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────
 
 def _watchdog(cw, ch):
     while True:
@@ -500,20 +405,20 @@ def parse_args():
     import rclpy.utilities
     argv = rclpy.utilities.remove_ros_args(sys.argv[1:])
     p = argparse.ArgumentParser()
-    p.add_argument('--port',  type=int, default=DEFAULT_PORT)
-    p.add_argument('--scale', type=int, default=DEFAULT_SCALE)
+    p.add_argument('--port',     type=int, default=DEFAULT_PORT)
+    p.add_argument('--canvas-w', type=int, default=CANVAS_W)
+    p.add_argument('--canvas-h', type=int, default=CANVAS_H)
     return p.parse_args(argv)
 
 
 def main():
     rclpy.init()
-    args     = parse_args()
-    canvas_w = BEV_W * args.scale
-    canvas_h = BEV_H * args.scale
-    start_server(args.port, canvas_w, canvas_h)
+    args = parse_args()
+    start_server(args.port, args.canvas_w, args.canvas_h)
     print(f'\n[Dashboard]  http://<navqplus-ip>:{args.port}\n')
-    threading.Thread(target=_watchdog, args=(canvas_w, canvas_h), daemon=True).start()
-    node = VisionStreamNode(canvas_w, canvas_h)
+    threading.Thread(target=_watchdog, args=(args.canvas_w, args.canvas_h),
+                     daemon=True).start()
+    node = VisionStreamNode(args.canvas_w, args.canvas_h)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

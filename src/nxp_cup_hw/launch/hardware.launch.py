@@ -5,22 +5,38 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
 
-        # ── Vision ────────────────────────────────────────────────────────────
+        # ── Camera driver ─────────────────────────────────────────────────────
         Node(
             package="nxp_cup_hw",
+            executable="camera_node",
+            name="camera_node",
+            output="screen",
+            parameters=[{
+                "device":       "/dev/video3",
+                "width":        640,
+                "height":       480,
+                "fps":          30,
+                "jpeg_quality": 80,
+            }],
+        ),
+
+        # ── Vision (nxp_cup_vision package) ──────────────────────────────────
+        # Publishes /edge_vectors (EdgeVectors) + /nxp_cup/debug_image directly
+        Node(
+            package="nxp_cup_vision",
             executable="nxp_track_vision",
             name="nxp_track_vision",
             output="screen",
+            parameters=[{'debug': True}],
         ),
 
-        # ── Stream viewer ────────────────────────────────────────────────────────
-#        Node(
-#            package="nxp_cup_hw",
-#            executable="vision_stream",
-#            name="vision_stream",
-#            output="screen",
-#
-#        ),
+        # ── Vision stream dashboard  (http://<navqplus-ip>:8081) ─────────────
+        # Node(
+        #     package="nxp_cup_hw",
+        #     executable="vision_stream",
+        #     name="vision_stream",
+        #     output="screen",
+        # ),
 
         # ── Bicycle model ─────────────────────────────────────────────────────
         Node(
@@ -37,34 +53,34 @@ def generate_launch_description():
             }],
         ),
 
-        # ── Lane chain → EdgeVectors bridge (for b3rb_ros_mrac) ─────────────
+        # ── PCA9685 (motors + servo) ───────────────────────────────────────────
         Node(
             package="nxp_cup_hw",
-            executable="lane_to_edge_vectors",
-            name="lane_to_edge_vectors",
+            executable="pca9685_node",
             output="screen",
+            parameters=[{'min_speed_only': False}],
         ),
 
-        Node(
-            package="nxp_cup_hw",
-            executable="pca9685_node", 
-            output="screen"),
-
+        # ── Encoder odometry ──────────────────────────────────────────────────
         Node(
             package="nxp_cup_hw",
             executable="pcf8574ap_node",
-            output="screen"),
+            output="screen",
+        ),
 
-        Node(
-            package="nxp_cup_hw",
-            executable="mpu6050_node",
-            output="screen"),
+        # ── IMU ───────────────────────────────────────────────────────────────
+        # Commented out — OSError on i2c-5, re-enable when IMU is connected
+        # Node(
+        #     package="nxp_cup_hw",
+        #     executable="mpu6050_node",
+        #     output="screen",
+        # ),
 
+        # ── Odometry fusion ───────────────────────────────────────────────────
         Node(
             package="nxp_cup_hw",
             executable="odom_fusion_node",
             output="screen",
-            parameters=[{"use_imu": False}],   # set True to enable IMU fusion
+            parameters=[{"use_imu": False}],
         ),
-
     ])
